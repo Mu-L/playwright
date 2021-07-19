@@ -16,13 +16,15 @@
 
 //@ts-check
 const path = require('path');
-const {devices} = require('../..');
-const Documentation = require('../doclint/Documentation');
+const os = require('os');
+const toKebabCase = require('lodash/kebabCase')
+const devices = require('../../src/server/deviceDescriptors');
+const Documentation = require('../doclint/documentation');
 const PROJECT_DIR = path.join(__dirname, '..', '..');
 const fs = require('fs');
 const {parseOverrides} = require('./parseOverrides');
 const exported = require('./exported.json');
-const { MDOutline } = require('../doclint/MDBuilder');
+const { parseApi } = require('../doclint/api_parser');
 
 const objectDefinitions = [];
 const handledMethods = new Set();
@@ -34,15 +36,21 @@ let hadChanges = false;
   const typesDir = path.join(PROJECT_DIR, 'types');
   if (!fs.existsSync(typesDir))
     fs.mkdirSync(typesDir)
-  writeFile(path.join(typesDir, 'protocol.d.ts'), fs.readFileSync(path.join(PROJECT_DIR, 'src', 'server', 'chromium', 'protocol.ts'), 'utf8'));
-  writeFile(path.join(typesDir, 'trace.d.ts'), fs.readFileSync(path.join(PROJECT_DIR, 'src', 'trace', 'traceTypes.ts'), 'utf8'));
-  const outline = new MDOutline(path.join(PROJECT_DIR, 'docs', 'src', 'api-body.md'), path.join(PROJECT_DIR, 'docs', 'src', 'api-params.md'));
-  outline.copyDocsFromSuperclasses([]);
-  const createMemberLink = (text) => {
-    const anchor = text.toLowerCase().split(',').map(c => c.replace(/[^a-z]/g, '')).join('-');
-    return `[${text}](https://github.com/microsoft/playwright/blob/master/docs/api.md#${anchor})`;
+  writeFile(path.join(typesDir, 'protocol.d.ts'), fs.readFileSync(path.join(PROJECT_DIR, 'src', 'server', 'chromium', 'protocol.d.ts'), 'utf8'));
+  documentation = parseApi(path.join(PROJECT_DIR, 'docs', 'src', 'api'));
+  documentation.filterForLanguage('js');
+  documentation.copyDocsFromSuperclasses([]);
+  const createMarkdownLink = (member, text) => {
+    const className = toKebabCase(member.clazz.name);
+    const memberName = toKebabCase(member.name);
+    let hash = null
+    if (member.kind === 'property' || member.kind === 'method')
+      hash = `${className}-${memberName}`.toLowerCase();
+    else if (member.kind === 'event')
+      hash = `${className}-event-${memberName}`.toLowerCase();
+    return `[${text}](https://playwright.dev/docs/api/class-${member.clazz.name.toLowerCase()}#${hash})`;
   };
-  outline.setLinkRenderer(item => {
+  documentation.setLinkRenderer(item => {
     const { clazz, member, param, option } = item;
     if (param)
       return `\`${param}\``;
@@ -51,15 +59,14 @@ let hadChanges = false;
     if (clazz)
       return `[${clazz.name}]`;
     if (member.kind === 'method')
-      return createMemberLink(`${member.clazz.varName}.${member.name}(${member.signature})`);
+      return createMarkdownLink(member, `${member.clazz.varName}.${member.alias}(${renderJSSignature(member.argsArray)})`);
     if (member.kind === 'event')
-      return createMemberLink(`${member.clazz.varName}.on('${member.name}')`);
+      return createMarkdownLink(member, `${member.clazz.varName}.on('${member.alias.toLowerCase()}')`);
     if (member.kind === 'property')
-      return createMemberLink(`${member.clazz.varName}.${member.name}`);
+      return createMarkdownLink(member, `${member.clazz.varName}.${member.alias}`);
     throw new Error('Unknown member kind ' + member.kind);
   });
-  outline.generateSourceCodeComments();
-  documentation = outline.documentation;
+  documentation.generateSourceCodeComments();
 
   // Root module types are overridden.
   const playwrightClass = documentation.classes.get('Playwright');
@@ -79,7 +86,7 @@ let hadChanges = false;
     return writeComment(docClassForName(className).comment) + '\n';
   }, (className, methodName) => {
     const docClass = docClassForName(className);
-    const method = docClass.methods.get(methodName);
+    const method = docClass.methodsArray.find(m => m.alias === methodName);
     handledMethods.add(`${className}.${methodName}`);
     if (!method) {
       if (new Set(['on', 'addListener', 'off', 'removeListener', 'once']).has(methodName))
@@ -97,9 +104,17 @@ ${overrides}
 ${classes.map(classDesc => classToString(classDesc)).join('\n')}
 ${objectDefinitionsToString(overrides)}
 ${generateDevicesTypes()}
+
+export interface ChromiumBrowserContext extends BrowserContext { }
+export interface ChromiumBrowser extends Browser { }
+export interface FirefoxBrowser extends Browser { }
+export interface WebKitBrowser extends Browser { }
+export interface ChromiumCoverage extends Coverage { }
 `;
   for (const [key, value] of Object.entries(exported))
     output = output.replace(new RegExp('\\b' + key + '\\b', 'g'), value);
+  // remove trailing whitespace
+  output = output.replace(/( +)\n/g, '\n');
   writeFile(path.join(typesDir, 'types.d.ts'), output);
   process.exit(hadChanges && process.argv.includes('--check-clean') ? 1 : 0);
 })().catch(e => {
@@ -108,6 +123,8 @@ ${generateDevicesTypes()}
 });
 
 function writeFile(filePath, content) {
+  if (os.platform() === 'win32')
+    content = content.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
   const existing = fs.readFileSync(filePath, 'utf8');
   if (existing === content)
     return;
@@ -135,7 +152,7 @@ function objectDefinitionsToString(overriddes) {
 }
 
 function nameForProperty(member) {
-  return (member.required || member.name.startsWith('...')) ? member.name : member.name + '?';
+  return (member.required || member.alias.startsWith('...')) ? member.alias : member.alias + '?';
 }
 
 /**
@@ -182,7 +199,8 @@ function createEventDescriptions(classDesc) {
   if (!hasUniqueEvents(classDesc))
     return [];
   const descriptions = [];
-  for (const [eventName, value] of classDesc.events) {
+  for (let [eventName, value] of classDesc.events) {
+    eventName = eventName.toLowerCase();
     const type = stringifyComplexType(value && value.type, '', classDesc.name, eventName, 'payload');
     const argName = argNameForType(type);
     const params = argName ? `${argName}: ${type}` : '';
@@ -202,10 +220,17 @@ function createEventDescriptions(classDesc) {
 function classBody(classDesc) {
   const parts = [];
   const eventDescriptions = createEventDescriptions(classDesc);
+  const commentForMethod = {
+    off: 'Removes an event listener added by `on` or `addListener`.',
+    removeListener: 'Removes an event listener added by `on` or `addListener`.',
+    once: 'Adds an event listener that will be automatically removed after it is triggered once. See `addListener` for more information about this event.'
+  }
   for (const method of ['on', 'once', 'addListener', 'removeListener', 'off']) {
     for (const {eventName, params, comment} of eventDescriptions) {
-        if (comment)
+        if ((method === 'on' || method === 'addListener') && comment)
           parts.push(writeComment(comment, '  '));
+        else
+          parts.push(writeComment(commentForMethod[method], '  '));
         parts.push(`  ${method}(event: '${eventName}', listener: (${params}) => void): this;\n`);
     }
   }
@@ -214,23 +239,25 @@ function classBody(classDesc) {
   parts.push(members.map(member => {
     if (member.kind === 'event')
       return '';
-    if (member.name === 'waitForEvent') {
+    if (member.alias === 'waitForEvent') {
       const parts = [];
       for (const {eventName, params, comment, type} of eventDescriptions) {
         if (comment)
           parts.push(writeComment(comment, '  '));
-        parts.push(`  ${member.name}(event: '${eventName}', optionsOrPredicate?: { predicate?: (${params}) => boolean, timeout?: number } | ((${params}) => boolean)): Promise<${type}>;\n`);
+        parts.push(`  ${member.alias}(event: '${eventName}', optionsOrPredicate?: { predicate?: (${params}) => boolean | Promise<boolean>, timeout?: number } | ((${params}) => boolean | Promise<boolean>)): Promise<${type}>;\n`);
       }
 
       return parts.join('\n');
     }
     const jsdoc = memberJSDOC(member, '  ');
     const args = argsFromMember(member, '  ', classDesc.name);
-    const type = stringifyComplexType(member.type, '  ', classDesc.name, member.name);
+    let type = stringifyComplexType(member.type, '  ', classDesc.name, member.alias);
+    if (member.async)
+      type = `Promise<${type}>`;
     // do this late, because we still want object definitions for overridden types
-    if (!hasOwnMethod(classDesc, member.name))
+    if (!hasOwnMethod(classDesc, member.alias))
       return '';
-    return `${jsdoc}${member.name}${args}: ${type};`
+    return `${jsdoc}${member.alias}${args}: ${type};`
   }).filter(x => x).join('\n\n'));
   return parts.join('\n');
 }
@@ -260,11 +287,28 @@ function parentClass(classDesc) {
 
 function writeComment(comment, indent = '') {
   const parts = [];
-  
-  comment = comment.replace(/\[`([^`]+)`\]\(#([^\)]+)\)/g, '[$1](https://github.com/microsoft/playwright/blob/master/docs/api.md#$2)');
-  comment = comment.replace(/\[([^\]]+)\]\(#([^\)]+)\)/g, '[$1](https://github.com/microsoft/playwright/blob/master/docs/api.md#$2)');
-  comment = comment.replace(/\[`([^`]+)`\]\(\.\/([^\)]+)\)/g, '[$1](https://github.com/microsoft/playwright/blob/master/docs/$2)');
-  comment = comment.replace(/\[([^\]]+)\]\(\.\/([^\)]+)\)/g, '[$1](https://github.com/microsoft/playwright/blob/master/docs/$2)');
+  const out = [];
+  const pushLine = (line) => {
+    if (line || out[out.length - 1])
+      out.push(line)
+  };
+  let skipExample = false;
+  for (let line of comment.split('\n')) {
+    const match = line.match(/```(\w+)/);
+    if (match) {
+      const lang = match[1];
+      skipExample = !["html", "yml", "bash", "js"].includes(lang);
+    } else if (skipExample && line.trim().startsWith('```')) {
+      skipExample = false;
+      continue;
+    }
+    if (!skipExample)
+      pushLine(line);
+  }
+  comment = out.join('\n');
+  comment = comment.replace(/\[([^\]]+)\]\(\.\/([^\)]+)\)/g, (match, p1, p2) => {
+    return `[${p1}](https://playwright.dev/docs/${p2.replace('.md', '')})`;
+  });
 
   parts.push(indent + '/**');
   parts.push(...comment.split('\n').map(line => indent + ' * ' + line.replace(/\*\//g, '*\\/')));
@@ -308,11 +352,12 @@ function stringifySimpleType(type, indent = '', ...namespace) {
   if (type.name === 'Object' && type.properties && type.properties.length) {
     const name = namespace.map(n => n[0].toUpperCase() + n.substring(1)).join('');
     const shouldExport = exported[name];
-    objectDefinitions.push({name, properties: type.properties});
+    const properties = namespace[namespace.length -1] === 'options' ? type.sortedProperties() : type.properties;
+    objectDefinitions.push({name, properties: properties});
     if (shouldExport) {
       out = name;
     } else {
-      out = stringifyObjectType(type.properties, name, indent);
+      out = stringifyObjectType(properties, name, indent);
     }
   }
 
@@ -327,6 +372,8 @@ function stringifySimpleType(type, indent = '', ...namespace) {
   }
   if (out === 'path')
     return 'string';
+  if (out === 'Any')
+    return 'any';
   if (type.templates)
     out += '<' + type.templates.map(t => stringifySimpleType(t, indent, ...namespace)).join(', ') + '>';
   if (type.union)
@@ -350,7 +397,9 @@ function memberJSDOC(member, indent) {
   const lines = [];
   if (member.comment)
     lines.push(...member.comment.split('\n'));
-  lines.push(...member.argsArray.map(arg => `@param ${arg.name.replace(/\./g, '')} ${arg.comment.replace('\n', ' ')}`));
+  if (member.deprecated)
+    lines.push('@deprecated');
+  lines.push(...member.argsArray.map(arg => `@param ${arg.alias.replace(/\./g, '')} ${arg.comment.replace('\n', ' ')}`));
   if (!lines.length)
     return indent;
   return writeComment(lines.join('\n'), indent) + '\n' + indent;
@@ -365,4 +414,31 @@ function generateDevicesTypes() {
 ${namedDevices}
   [key: string]: DeviceDescriptor;
 }`;
+}
+
+/**
+ * @param {Documentation.Member[]} args
+ */
+function renderJSSignature(args) {
+  const tokens = [];
+  let hasOptional = false;
+  for (const arg of args) {
+    const name = arg.alias;
+    const optional = !arg.required;
+    if (tokens.length) {
+      if (optional && !hasOptional)
+        tokens.push(`[, ${name}`);
+      else
+        tokens.push(`, ${name}`);
+    } else {
+      if (optional && !hasOptional)
+        tokens.push(`[${name}`);
+      else
+        tokens.push(`${name}`);
+    }
+    hasOptional = hasOptional || optional;
+  }
+  if (hasOptional)
+    tokens.push(']');
+  return tokens.join('');
 }

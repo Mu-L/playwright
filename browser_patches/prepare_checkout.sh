@@ -4,12 +4,13 @@ set +x
 
 trap "cd $(pwd -P)" EXIT
 cd "$(dirname "$0")"
+SCRIPT_PATH=$(pwd -P)
 
 REMOTE_BROWSER_UPSTREAM="browser_upstream"
 BUILD_BRANCH="playwright-build"
 
 if [[ ($1 == '--help') || ($1 == '-h') ]]; then
-  echo "usage: $(basename $0) [firefox|webkit] [custom_checkout_path]"
+  echo "usage: $(basename $0) [firefox|firefox-beta|webkit] [custom_checkout_path]"
   echo
   echo "Prepares browser checkout. The checkout is a GIT repository that:"
   echo "- has a '$REMOTE_BROWSER_UPSTREAM' remote pointing to a REMOTE_URL from UPSTREAM_CONFIG.sh"
@@ -26,6 +27,44 @@ if [[ $# == 0 ]]; then
   exit 1
 fi
 
+function prepare_chromium_checkout {
+  cd "${SCRIPT_PATH}"
+
+  source "${SCRIPT_PATH}/chromium/ensure_depot_tools.sh"
+
+  if [[ -z "${CR_CHECKOUT_PATH}" ]]; then
+    echo "ERROR: chromium compilation requires CR_CHECKOUT_PATH to be set to reuse checkout."
+    echo "NOTE: we expect '\$CR_CHECKOUT_PATH/src' to exist to be a valid chromium checkout."
+    exit 1
+  fi
+
+  # Get chromium SHA from the build revision.
+  # This will get us the last redirect URL from the crrev.com service.
+  CRREV=$(head -1 ./chromium/BUILD_NUMBER)
+  REVISION_URL=$(curl -ILs -o /dev/null -w %{url_effective} "https://crrev.com/${CRREV}")
+  CRSHA="${REVISION_URL##*/}"
+
+  # Update Chromium checkout.
+  #
+  # This is based on https://chromium.googlesource.com/chromium/src/+/master/docs/linux/build_instructions.md#get-the-code
+  if [[ ! -d "${CR_CHECKOUT_PATH}/src" ]]; then
+    rm -rf "${CR_CHECKOUT_PATH}"
+    mkdir -p "${CR_CHECKOUT_PATH}"
+    cd "${CR_CHECKOUT_PATH}"
+    fetch --nohooks chromium
+    cd src
+    if [[ $(uname) == "Linux" ]]; then
+      ./build/install-build-deps.sh
+    fi
+    gclient runhooks
+  fi
+  cd "${CR_CHECKOUT_PATH}/src"
+  git checkout master
+  git pull origin master
+  git checkout "${CRSHA}"
+  gclient sync -D
+}
+
 # FRIENDLY_CHECKOUT_PATH is used only for logging.
 FRIENDLY_CHECKOUT_PATH="";
 CHECKOUT_PATH=""
@@ -34,7 +73,7 @@ BUILD_NUMBER=""
 WEBKIT_EXTRA_FOLDER_PATH=""
 FIREFOX_EXTRA_FOLDER_PATH=""
 if [[ ("$1" == "chromium") || ("$1" == "chromium/") || ("$1" == "cr") ]]; then
-  echo "FYI: chromium checkout is not supported. Use '//browser_patches/chromium/build.sh' instead"
+  prepare_chromium_checkout
   exit 0
 elif [[ ("$1" == "ffmpeg") || ("$1" == "ffmpeg/") ]]; then
   echo "FYI: ffmpeg checkout is not supported. Use '//browser_patches/ffmpeg/build.sh' instead"
@@ -54,6 +93,23 @@ elif [[ ("$1" == "firefox") || ("$1" == "firefox/") || ("$1" == "ff") ]]; then
     CHECKOUT_PATH="${FF_CHECKOUT_PATH}"
     FRIENDLY_CHECKOUT_PATH="<FF_CHECKOUT_PATH>"
   fi
+elif [[ ("$1" == "firefox-beta") || ("$1" == "ff-beta") ]]; then
+  # NOTE: firefox-beta re-uses firefox checkout.
+  FRIENDLY_CHECKOUT_PATH="//browser_patches/firefox/checkout";
+  CHECKOUT_PATH="$PWD/firefox/checkout"
+
+  PATCHES_PATH="$PWD/firefox-beta/patches"
+  FIREFOX_EXTRA_FOLDER_PATH="$PWD/firefox-beta/juggler"
+  BUILD_NUMBER=$(head -1 "$PWD/firefox-beta/BUILD_NUMBER")
+  source "./firefox-beta/UPSTREAM_CONFIG.sh"
+  if [[ ! -z "${FF_CHECKOUT_PATH}" ]]; then
+    echo "WARNING: using checkout path from FF_CHECKOUT_PATH env: ${FF_CHECKOUT_PATH}"
+    CHECKOUT_PATH="${FF_CHECKOUT_PATH}"
+    FRIENDLY_CHECKOUT_PATH="<FF_CHECKOUT_PATH>"
+  fi
+elif [[ ("$1" == "deprecated-webkit-mac-10.14") ]]; then
+  echo "FYI: deprecated-webkit-mac-10.14 has no checkout anymore"
+  exit 0
 elif [[ ("$1" == "webkit") || ("$1" == "webkit/") || ("$1" == "wk") ]]; then
   FRIENDLY_CHECKOUT_PATH="//browser_patches/webkit/checkout";
   CHECKOUT_PATH="$PWD/webkit/checkout"
@@ -81,7 +137,14 @@ fi
 # if there's no checkout folder - checkout one.
 if ! [[ -d $CHECKOUT_PATH ]]; then
   echo "-- $FRIENDLY_CHECKOUT_PATH is missing - checking out.."
-  git clone --single-branch --depth 1 --branch $BASE_BRANCH $REMOTE_URL $CHECKOUT_PATH
+  if [[ -n "$CI" ]]; then
+    # In CI environment, we re-checkout constantly, so we do a shallow checkout to save time.
+    git clone --single-branch --depth 1 --branch $BASE_BRANCH $REMOTE_URL $CHECKOUT_PATH
+  else
+    # In non-CI environment, do a full checkout. This takes time,
+    # but liberates from the `git fetch --unshallow`.
+    git clone --single-branch --branch $BASE_BRANCH $REMOTE_URL $CHECKOUT_PATH
+  fi
 else
   echo "-- checking $FRIENDLY_CHECKOUT_PATH folder - OK"
 fi
@@ -110,6 +173,7 @@ if git remote get-url $REMOTE_BROWSER_UPSTREAM >/dev/null; then
 else
   echo "-- adding |$REMOTE_BROWSER_UPSTREAM| remote to $REMOTE_URL"
   git remote add $REMOTE_BROWSER_UPSTREAM $REMOTE_URL
+  git fetch --depth 1 $REMOTE_BROWSER_UPSTREAM $BASE_BRANCH
 fi
 
 # Check if our checkout contains BASE_REVISION.
@@ -173,7 +237,7 @@ elif [[ ! -z "${FIREFOX_EXTRA_FOLDER_PATH}" ]]; then
   git add $EMBEDDER_DIR
 fi
 
-git commit -a --author="playwright-devops <devops@playwright.dev>" -m "chore: bootstrap build #$BUILD_NUMBER"
+git commit -a --author="playwright-devops <devops@playwright.dev>" -m "chore($1): bootstrap build #$BUILD_NUMBER"
 
 echo
 echo

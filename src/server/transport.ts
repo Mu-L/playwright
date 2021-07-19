@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-import * as WebSocket from 'ws';
+import WebSocket from 'ws';
 import { Progress } from './progress';
 import { makeWaitForNextTask } from '../utils/utils';
 
@@ -50,14 +50,15 @@ export class WebSocketTransport implements ConnectionTransport {
 
   onmessage?: (message: ProtocolResponse) => void;
   onclose?: () => void;
+  readonly wsEndpoint: string;
 
-  static async connect(progress: Progress, url: string): Promise<WebSocketTransport> {
+  static async connect(progress: Progress, url: string, headers?: { [key: string]: string; }): Promise<WebSocketTransport> {
     progress.log(`<ws connecting> ${url}`);
-    const transport = new WebSocketTransport(progress, url);
+    const transport = new WebSocketTransport(progress, url, headers);
     let success = false;
-    progress.aborted.then(() => {
+    progress.cleanupWhenAborted(async () => {
       if (!success)
-        transport.closeAndWait().catch(e => null);
+        await transport.closeAndWait().catch(e => null);
     });
     await new Promise<WebSocketTransport>((fulfill, reject) => {
       transport._ws.addEventListener('open', async () => {
@@ -74,11 +75,13 @@ export class WebSocketTransport implements ConnectionTransport {
     return transport;
   }
 
-  constructor(progress: Progress, url: string) {
+  constructor(progress: Progress, url: string, headers?: { [key: string]: string; }) {
+    this.wsEndpoint = url;
     this._ws = new WebSocket(url, [], {
       perMessageDeflate: false,
       maxPayload: 256 * 1024 * 1024, // 256Mb,
       handshakeTimeout: progress.timeUntilDeadline(),
+      headers
     });
     this._progress = progress;
     // The 'ws' module in node sometimes sends us multiple messages in a single task.
@@ -89,8 +92,12 @@ export class WebSocketTransport implements ConnectionTransport {
 
     this._ws.addEventListener('message', event => {
       messageWrap(() => {
-        if (this.onmessage)
-          this.onmessage.call(null, JSON.parse(event.data));
+        try {
+          if (this.onmessage)
+            this.onmessage.call(null, JSON.parse(event.data));
+        } catch (e) {
+          this._ws.close();
+        }
       });
     });
 
@@ -113,8 +120,8 @@ export class WebSocketTransport implements ConnectionTransport {
   }
 
   async closeAndWait() {
-    const promise = new Promise(f => this.onclose = f);
+    const promise = new Promise(f => this._ws.once('close', f));
     this.close();
-    return promise; // Make sure to await the actual disconnect.
+    await promise; // Make sure to await the actual disconnect.
   }
 }

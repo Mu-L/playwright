@@ -14,51 +14,12 @@
  * limitations under the License.
  */
 
-import * as path from 'path';
+import path from 'path';
+import { StackFrame } from '../protocol/channels';
+import StackUtils from 'stack-utils';
+import { isUnderTest } from './utils';
 
-// NOTE: update this to point to playwright/lib when moving this file.
-const PLAYWRIGHT_LIB_PATH = path.normalize(path.join(__dirname, '..'));
-
-type ParsedStackFrame = { filePath: string, functionName: string };
-
-function parseStackFrame(frame: string): ParsedStackFrame | null {
-  frame = frame.trim();
-  if (!frame.startsWith('at '))
-    return null;
-  frame = frame.substring('at '.length);
-  if (frame.startsWith('async '))
-    frame = frame.substring('async '.length);
-  let location: string;
-  let functionName: string;
-  if (frame.endsWith(')')) {
-    const from = frame.indexOf('(');
-    location = frame.substring(from + 1, frame.length - 1);
-    functionName = frame.substring(0, from).trim();
-  } else {
-    location = frame;
-    functionName = '';
-  }
-  const match = location.match(/^(?:async )?([^(]*):(\d+):(\d+)$/);
-  if (!match)
-    return null;
-  const filePath = match[1];
-  return { filePath, functionName };
-}
-
-export function getCallerFilePath(ignorePrefix = PLAYWRIGHT_LIB_PATH): string | null {
-  const error = new Error();
-  const stackFrames = (error.stack || '').split('\n').slice(2);
-  // Find first stackframe that doesn't point to ignorePrefix.
-  for (const frame of stackFrames) {
-    const parsed = parseStackFrame(frame);
-    if (!parsed)
-      return null;
-    if (parsed.filePath.startsWith(ignorePrefix))
-      continue;
-    return parsed.filePath;
-  }
-  return null;
-}
+const stackUtils = new StackUtils();
 
 export function rewriteErrorMessage(e: Error, newMessage: string): Error {
   if (e.stack) {
@@ -70,3 +31,66 @@ export function rewriteErrorMessage(e: Error, newMessage: string): Error {
   return e;
 }
 
+const PW_LIB_DIRS = [
+  'playwright',
+  'playwright-chromium',
+  'playwright-firefox',
+  'playwright-webkit',
+  path.join('@playwright', 'test'),
+].map(packageName => path.sep + packageName);
+
+const runnerLib = path.join('@playwright', 'test', 'lib', 'test');
+const runnerSrc = path.join('src', 'test');
+
+export type ParsedStackTrace = {
+  frames: StackFrame[];
+  frameTexts: string[];
+  apiName: string;
+};
+
+export function captureStackTrace(): ParsedStackTrace {
+  const stackTraceLimit = Error.stackTraceLimit;
+  Error.stackTraceLimit = 30;
+  const error = new Error();
+  const stack = error.stack!;
+  Error.stackTraceLimit = stackTraceLimit;
+  const frames: StackFrame[] = [];
+  const frameTexts: string[] = [];
+  const lines = stack.split('\n').reverse();
+  let apiName = '';
+
+  const isTesting = process.env.PWTEST_CLI_ALLOW_TEST_COMMAND || isUnderTest();
+
+  for (const line of lines) {
+    const frame = stackUtils.parseLine(line);
+    if (!frame || !frame.file)
+      continue;
+    if (frame.file.startsWith('internal'))
+      continue;
+    const fileName = path.resolve(process.cwd(), frame.file);
+    if (isTesting && fileName.includes(path.join('playwright', 'tests', 'config', 'coverage.js')))
+      continue;
+    if (!fileName.includes(runnerLib) && !(isTesting && fileName.includes(runnerSrc)) && PW_LIB_DIRS.map(p => path.join(p, isTesting ? 'src' : 'lib')).some(libDir => fileName.includes(libDir))) {
+      apiName = frame.function ? frame.function[0].toLowerCase() + frame.function.slice(1) : '';
+      break;
+    }
+    frameTexts.push(line);
+    frames.push({
+      file: fileName,
+      line: frame.line,
+      column: frame.column,
+      function: frame.function,
+    });
+  }
+  frames.reverse();
+  frameTexts.reverse();
+  return { frames, frameTexts, apiName };
+}
+
+export function splitErrorMessage(message: string): { name: string, message: string } {
+  const separationIdx = message.indexOf(':');
+  return {
+    name: separationIdx !== -1 ? message.slice(0, separationIdx) : '',
+    message: separationIdx !== -1 && separationIdx + 2 <= message.length ? message.substring(separationIdx + 2) : message,
+  };
+}

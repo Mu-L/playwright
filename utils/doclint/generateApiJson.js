@@ -18,14 +18,14 @@
 
 const path = require('path');
 const fs = require('fs');
-const Documentation = require('./Documentation');
-const { MDOutline } = require('./MDBuilder');
+const Documentation = require('./documentation');
+const { parseApi } = require('./api_parser');
 const PROJECT_DIR = path.join(__dirname, '..', '..');
 
 {
-  const outline = new MDOutline(path.join(PROJECT_DIR, 'docs', 'src', 'api-body.md'), path.join(PROJECT_DIR, 'docs', 'src', 'api-params.md'));
-  outline.setLinkRenderer(item => {
-    const { clazz, member, param, option } = item;
+  const documentation = parseApi(path.join(PROJECT_DIR, 'docs', 'src', 'api'));
+  documentation.setLinkRenderer(item => {
+    const { clazz, param, option } = item;
     if (param)
       return `\`${param}\``;
     if (option)
@@ -33,9 +33,9 @@ const PROJECT_DIR = path.join(__dirname, '..', '..');
     if (clazz)
       return `\`${clazz.name}\``;
   });
-  outline.generateSourceCodeComments();
-  const result = serialize(outline);
-  fs.writeFileSync(path.join(PROJECT_DIR, 'api.json'), JSON.stringify(result));
+  documentation.generateSourceCodeComments();
+  const result = serialize(documentation);
+  console.log(JSON.stringify(result));
 }
 
 /**
@@ -49,9 +49,14 @@ function serialize(documentation) {
  * @param {Documentation.Class} clazz
  */
 function serializeClass(clazz) {
-  const result = { name: clazz.name };
+  const result = { name: clazz.name, spec: clazz.spec };
   if (clazz.extends)
     result.extends = clazz.extends;
+  result.langs = clazz.langs;
+  if (result.langs && result.langs.types) {
+    for (const key in result.langs.types)
+      result.langs.types[key] = serializeType(result.langs.types[key]);
+  }
   if (clazz.comment)
     result.comment = clazz.comment;
   result.members = clazz.membersArray.map(serializeMember);
@@ -74,7 +79,7 @@ function serializeProperty(arg) {
   const result = { ...arg };
   sanitize(result);
   if (arg.type)
-    result.type = serializeType(arg.type)
+    result.type = serializeType(arg.type, arg.name === 'options')
   return result;
 }
 
@@ -82,23 +87,24 @@ function sanitize(result) {
   delete result.args;
   delete result.argsArray;
   delete result.clazz;
-  delete result.spec;
+  delete result.enclosingMethod;
 }
 
 /**
  * @param {Documentation.Type} type
+ * @param {boolean} sortProperties
  */
-function serializeType(type) {
+function serializeType(type, sortProperties = false) {
   /** @type {any} */
   const result = { ...type };
   if (type.properties)
-    result.properties = type.properties.map(serializeProperty);
+    result.properties = (sortProperties ? type.sortedProperties() : type.properties).map(serializeProperty);
   if (type.union)
-    result.union = type.union.map(serializeType);
+    result.union = type.union.map(type => serializeType(type));
   if (type.templates)
-    result.templates = type.templates.map(serializeType);
+    result.templates = type.templates.map(type => serializeType(type));
   if (type.args)
-    result.args = type.args.map(serializeType);
+    result.args = type.args.map(type => serializeType(type));
   if (type.returnType)
     result.returnType = serializeType(type.returnType);
   return result;

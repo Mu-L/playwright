@@ -15,8 +15,8 @@
  */
 
 const {blobServiceClient, gunzipAsync, deleteBlob} = require('./utils.js');
-const {processDashboardV1} = require('./dashboard_v1.js');
-const {processDashboardV2} = require('./dashboard_v2.js');
+const {processDashboardRaw} = require('./dashboard_raw.js');
+const {processDashboardCompressedV1} = require('./dashboard_compressed_v1.js');
 
 module.exports = async function(context) {
   // First thing we do - delete the blob.
@@ -26,9 +26,7 @@ module.exports = async function(context) {
   const data = await gunzipAsync(context.bindings.newBlob);
   const report = JSON.parse(data.toString('utf8'));
 
-  // Upload report to both dashboards.
-  await Promise.all([
-    processDashboardV1(context, report),
-    processDashboardV2(context, report),
-  ]);
+  // Process dashboards one-by-one to limit max heap utilization.
+  const {reports, commitSHA} = await processDashboardRaw(context, report);
+  await processDashboardCompressedV1(context, reports, commitSHA);
 }

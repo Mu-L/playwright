@@ -16,15 +16,19 @@
  */
 
 import { WKBrowser } from '../webkit/wkBrowser';
-import { Env } from '../processLauncher';
-import * as path from 'path';
+import { Env } from '../../utils/processLauncher';
+import path from 'path';
 import { kBrowserCloseMessageId } from './wkConnection';
 import { BrowserType } from '../browserType';
 import { ConnectionTransport } from '../transport';
-import { BrowserOptions } from '../browser';
+import { BrowserOptions, PlaywrightOptions } from '../browser';
 import * as types from '../types';
 
 export class WebKit extends BrowserType {
+  constructor(playwrightOptions: PlaywrightOptions) {
+    super('webkit', playwrightOptions);
+  }
+
   _connectToTransport(transport: ConnectionTransport, options: BrowserOptions): Promise<WKBrowser> {
     return WKBrowser.connect(transport, options);
   }
@@ -45,9 +49,9 @@ export class WebKit extends BrowserType {
     const { args = [], proxy, devtools, headless } = options;
     if (devtools)
       console.warn('devtools parameter as a launch argument in WebKit is not supported. Also starting Web Inspector manually will terminate the execution in WebKit.');
-    const userDataDirArg = args.find(arg => arg.startsWith('--user-data-dir='));
+    const userDataDirArg = args.find(arg => arg.startsWith('--user-data-dir'));
     if (userDataDirArg)
-      throw new Error('Pass userDataDir parameter instead of specifying --user-data-dir argument');
+      throw new Error('Pass userDataDir parameter to `browserType.launchPersistentContext(userDataDir, ...)` instead of specifying --user-data-dir argument');
     if (args.find(arg => !arg.startsWith('-')))
       throw new Error('Arguments can not specify page to be opened');
     const webkitArguments = ['--inspector-pipe'];

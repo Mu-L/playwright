@@ -17,9 +17,10 @@
 // @ts-check
 
 /** @typedef {{
- *    type: 'text' | 'li' | 'code' | 'properties' | 'h0' | 'h1' | 'h2' | 'h3' | 'h4',
+ *    type: 'text' | 'li' | 'code' | 'properties' | 'h0' | 'h1' | 'h2' | 'h3' | 'h4' | 'note',
  *    text?: string,
  *    codeLang?: string,
+ *    noteType?: string,
  *    lines?: string[],
  *    liType?: 'default' | 'bullet' | 'ordinal',
  *    children?: MarkdownNode[]
@@ -42,7 +43,7 @@ function flattenWrappedLines(content) {
       || trimmedLine.startsWith('*')
       || line.match(/\[[^\]]+\]:.*/)
       || singleLineExpression;
-    if (trimmedLine.startsWith('```') || trimmedLine.startsWith('---')) {
+    if (trimmedLine.startsWith('```') || trimmedLine.startsWith('---') || trimmedLine.startsWith(':::')) {
       inCodeBlock = !inCodeBlock;
       flushLastParagraph = true;
     }
@@ -124,11 +125,40 @@ function buildTree(lines) {
       };
       line = lines[++i];
       while (!line.trim().startsWith('```')) {
-        if (!line.startsWith(indent))
-          throw new Error('Bad code block ' + line);
-        node.lines.push(line.substring(indent.length));
+        if (line && !line.startsWith(indent)) {
+          const from = Math.max(0, i - 5)
+          const to = Math.min(lines.length, from + 10);
+          const snippet = lines.slice(from, to);
+          throw new Error(`Bad code block: ${snippet.join('\n')}`);
+        }
+        if (line)
+          line = line.substring(indent.length);
+        node.lines.push(line);
         line = lines[++i];
       }
+      appendNode(indent, node);
+      continue;
+    }
+
+    if (content.startsWith(':::')) {
+      /** @type {MarkdownNode} */
+      const node = {
+        type: 'note',
+        noteType: content.substring(3)
+      };
+      line = lines[++i];
+      const tokens = [];
+      while (!line.trim().startsWith(':::')) {
+        if (!line.startsWith(indent)) {
+          const from = Math.max(0, i - 5)
+          const to = Math.min(lines.length, from + 10);
+          const snippet = lines.slice(from, to);
+          throw new Error(`Bad comment block: ${snippet.join('\n')}`);
+        }
+        tokens.push(line.substring(indent.length));
+        line = lines[++i];
+      }
+      node.text = tokens.join(' ');
       appendNode(indent, node);
       continue;
     }
@@ -159,7 +189,7 @@ function buildTree(lines) {
         node.liType = 'ordinal';
       else if (content.startsWith('*'))
         node.liType = 'bullet';
-      else 
+      else
         node.liType = 'default';
     }
     appendNode(indent, node);
@@ -219,7 +249,8 @@ function innerRenderMdNode(indent, node, lastNode, result, maxColumns) {
     const bothLinks = node.text.match(/\[[^\]]+\]:/) && lastNode && lastNode.type === 'text' && lastNode.text.match(/\[[^\]]+\]:/);
     if (!bothTables && !bothGen && !bothComments && !bothLinks && lastNode && lastNode.text)
       newLine();
-      result.push(wrapText(node.text, maxColumns, indent));
+      for (const line of node.text.split('\n'))
+        result.push(wrapText(line, maxColumns, indent));
     return;
   }
 
@@ -229,6 +260,15 @@ function innerRenderMdNode(indent, node, lastNode, result, maxColumns) {
     for (const line of node.lines)
       result.push(indent + line);
     result.push(`${indent}\`\`\``);
+    newLine();
+    return;
+  }
+
+  if (node.type === 'note') {
+    newLine();
+    result.push(`${indent}:::${node.noteType}`);
+    result.push(`${wrapText(node.text, maxColumns, indent)}`);
+    result.push(`${indent}:::`);
     newLine();
     return;
   }
@@ -330,15 +370,16 @@ function visit(node, visitor, depth = 0) {
 
 /**
  * @param {MarkdownNode[]} nodes
+ * @param {boolean=} h3
  * @returns {string}
  */
-function generateToc(nodes) {
+function generateToc(nodes, h3) {
   const result = [];
   visitAll(nodes, (node, depth) => {
-    if (node.type === 'h1' || node.type === 'h2') {
+    if (node.type === 'h1' || node.type === 'h2' || (h3 && node.type === 'h3')) {
       let link = node.text.toLowerCase();
       link = link.replace(/[ ]+/g, '-');
-      link = link.replace(/[^\w-]/g, '');
+      link = link.replace(/[^\w-_]/g, '');
       result.push(`${' '.repeat(depth * 2)}- [${node.text}](#${link})`);
     }
   });

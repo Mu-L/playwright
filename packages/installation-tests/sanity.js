@@ -20,17 +20,20 @@ let success = {
   'playwright-chromium': ['chromium'],
   'playwright-firefox': ['firefox'],
   'playwright-webkit': ['webkit'],
+  '@playwright/test': ['chromium', 'firefox', 'webkit'],
 }[requireName];
 if (process.argv[3] === 'none')
   success = [];
-if (process.argv[3] === 'all')
+else if (process.argv[3] === 'all')
   success = ['chromium', 'firefox', 'webkit'];
+else if (process.argv[3])
+  success = process.argv.slice(3)
 
 const playwright = require(requireName);
 
 // Requiring internals should work.
 const errors = require(requireName + '/lib/utils/errors');
-const installer = require(requireName + '/lib/install/installer');
+const registry = require(requireName + '/lib/utils/registry');
 
 (async () => {
   for (const browserType of success) {
@@ -54,6 +57,7 @@ const installer = require(requireName + '/lib/install/installer');
       process.exit(1);
     } catch (e) {
       // All good.
+      console.log(`Expected error while launching ${browserType}: ${e}`);
     }
   }
   console.log(`require SUCCESS`);

@@ -27,6 +27,16 @@ if [[ ($1 == '--help') || ($1 == '-h') ]]; then
   exit 0
 fi
 
+if [[ ("${GITHUB_REPOSITORY}" != "microsoft/playwright") && ("${GITHUB_REPOSITORY}" != "microsoft/playwright-internal") ]]; then
+  echo "NOTE: skipping dashboard uploading from fork"
+  exit 0
+fi
+
+if [[ "${GITHUB_REF}" != "refs/heads/master" && "${GITHUB_REF}" != 'refs/heads/release-'* ]]; then
+  echo "NOTE: skipping dashboard uploading from Playwright branches"
+  exit 0
+fi
+
 if [[ -z "${FLAKINESS_CONNECTION_STRING}" ]]; then
   echo "ERROR: \$FLAKINESS_CONNECTION_STRING environment variable is missing."
   echo "       'Azure Account Name' and 'Azure Account Key' secrets are required"
@@ -48,6 +58,7 @@ export COMMIT_AUTHOR_EMAIL=$(git show -s --format=%ae HEAD)
 export COMMIT_TIMESTAMP=$(git show -s --format=%ct HEAD)
 
 export HOST_OS_NAME="$(uname)"
+export HOST_ARCH="$(uname -m)"
 export HOST_OS_VERSION=""
 if [[ "$HOST_OS_NAME" == "Darwin" ]]; then
   HOST_OS_VERSION=$(sw_vers -productVersion | grep -o '^\d\+.\d\+')
@@ -62,6 +73,7 @@ EMBED_METADATA_SCRIPT=$(cat <<EOF
   json.metadata = {
     runURL: process.env.BUILD_URL,
     osName: process.env.HOST_OS_NAME,
+    arch: process.env.HOST_ARCH,
     osVersion: process.env.HOST_OS_VERSION,
     commitSHA: process.env.COMMIT_SHA,
     commitTimestamp: process.env.COMMIT_TIMESTAMP,

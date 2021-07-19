@@ -1,16 +1,16 @@
 {
   "compilerOptions": {
-    "target": "ESNext",
+    "target": "ES2019",
     "module": "commonjs",
     "lib": ["esnext", "dom", "DOM.Iterable"],
-    "sourceMap": true,
-    "rootDir": "./src",
-    "outDir": "./lib",
+    "esModuleInterop": true,
     "strict": true,
     "allowJs": true,
-    "declaration": false
+    "jsx": "react",
+    "resolveJsonModule": true,
+    "noEmit": true,
   },
   "compileOnSave": true,
-  "include": ["src/**/*.ts", "src/**/*.js"],
-  "exclude": ["node_modules", "src/.eslintrc.js"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.js", "src/server/deviceDescriptorsSource.json"],
+  "exclude": ["node_modules", "src/.eslintrc.js", "src/**/*webpack.config.js"]
 }

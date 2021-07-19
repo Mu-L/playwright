@@ -13,25 +13,68 @@ configurations for common CI providers.
 3 steps to get your tests running on CI:
 
 1. **Ensure CI agent can run browsers**: Use [our Docker image](./docker.md)
-   in Linux agents. Windows and macOS agents do not require any additional dependencies.
-1. **Install Playwright**: In most projects, this would be done with `npm ci`
-   (or `npm install`). Playwright would install the relevant browsers automatically.
-1. **Run your tests**: Use `npm test` or equivalent to execute your tests.
+   in Linux agents or install your dependencies using the [CLI](./cli.md#install-system-dependencies). Windows and macOS agents do not require any additional dependencies.
+1. **Install Playwright**:
+   ```bash js
+   # Install NPM packages
+   npm ci
+   # or
+   npm install
+
+   # Install Playwright browsers
+   npx playwright install
+   ```
+   ```bash python
+   pip install playwright
+   playwright install
+   ```
+
+1. **Run your tests**:
+   ```bash js
+   npm test
+   ```
+   ```bash python
+   pytest
+   ```
 
 ## CI configurations
 
+The [Command Line Interface](./cli.md#install-system-dependencies) can be used to install all operating system dependencies on GitHub Actions.
+
 ### GitHub Actions
 
-The [Playwright GitHub Action](https://github.com/microsoft/playwright-github-action) can be used to run Playwright tests on GitHub Actions.
-
-```yml
+```yml js
 steps:
-  - uses: microsoft/playwright-github-action@v1
+  - uses: actions/checkout@v2
+  - uses: actions/setup-node@v2
+    with:
+      node-version: '14'
+  - name: Install operating system dependencies
+    run: npx playwright install-deps
   - name: Run your tests
     run: npm test
 ```
 
-We run [our tests](/.github/workflows/tests.yml) on GitHub Actions, across a matrix of 3 platforms (Windows, Linux, macOS) and 3 browsers (Chromium, Firefox, WebKit).
+```yml python
+steps:
+  - name: Set up Python
+    uses: actions/setup-python@v2
+    with:
+      python-version: 3.8
+  - name: Install dependencies
+    run: |
+      python -m pip install --upgrade pip
+      pip install playwright
+      pip install -e .
+  - name: Ensure browsers are installed
+    run: python -m playwright install
+  - name: Install operating system dependencies
+    run: python -m playwright install-deps
+  - name: Run your tests
+    run: pytest
+```
+
+We run [our tests](https://github.com/microsoft/playwright/blob/master/.github/workflows/tests_secondary.yml) on GitHub Actions, across a matrix of 3 platforms (Windows, Linux, macOS) and 3 browsers (Chromium, Firefox, WebKit).
 
 ### Docker
 
@@ -47,6 +90,30 @@ Suggested configuration
    ```js
    const browser = await playwright.chromium.launch({
      args: ['--disable-dev-shm-usage']
+   });
+   ```
+
+   ```java
+   Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
+     .setArgs(Arrays.asList("--disable-dev-shm-usage")));
+   ```
+
+   ```python async
+   browser = await playwright.chromium.launch(
+      args=['--disable-dev-shm-usage']
+   )
+   ```
+
+   ```python sync
+   browser = playwright.chromium.launch({
+      args=['--disable-dev-shm-usage']
+   })
+   ```
+
+   ```csharp
+   await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+   {
+        Args = new[] { "--disable-dev-shm-usage" }
    });
    ```
 
@@ -69,18 +136,15 @@ For Linux agents, you can use [our Docker container](./docker.md) with Azure Pip
 
 ```yml
 pool:
-  vmImage: 'ubuntu-18.04'
+  vmImage: 'ubuntu-20.04'
 
-container: mcr.microsoft.com/playwright:bionic
+container: mcr.microsoft.com/playwright:focal
 
 steps:
-- script: npm install
-- script: npm run test
+...
 ```
 
 ### Travis CI
-
-We run our tests on Travis CI over a Linux agent (Ubuntu 18.04).
 
 Suggested configuration
 1. [User namespace cloning](http://man7.org/linux/man-pages/man7/user_namespaces.7.html)
@@ -122,10 +186,10 @@ addons:
     - gstreamer1.0-plugins-bad
     # This is required to run chromium
     - libgbm1
-    # this is needed for running headful tests
+    # this is needed for running headed tests
     - xvfb
 
-# allow headful tests
+# allow headed tests
 before_install:
   # Enable user namespace cloning
   - "sysctl kernel.unprivileged_userns_clone=1"
@@ -136,15 +200,15 @@ before_install:
 
 ### CircleCI
 
-We run our tests on CircleCI, with our [pre-built Docker image](./docker.md). Running Playwright smoothly on CircleCI requires the following steps:
+Running Playwright on CircleCI requires the following steps:
 
 1. Use the pre-built [Docker image](./docker.md) in your config like so:
 
-   ```yaml
+   ```yml
    docker:
-     - image: mcr.microsoft.com/playwright:bionic
-       environment:
-         NODE_ENV: development # Needed if playwright is in `devDependencies`
+     - image: mcr.microsoft.com/playwright:focal
+   environment:
+     NODE_ENV: development # Needed if playwright is in `devDependencies`
    ```
 
 1. If you’re using Playwright through Jest, then you may encounter an error spawning child processes:
@@ -164,7 +228,7 @@ to run tests on Jenkins.
 
 ```groovy
 pipeline {
-   agent { docker { image 'mcr.microsoft.com/playwright:bionic' } }
+   agent { docker { image 'mcr.microsoft.com/playwright:focal' } }
    stages {
       stage('e2e-tests') {
          steps {
@@ -181,7 +245,7 @@ pipeline {
 Bitbucket Pipelines can use public [Docker images as build environments](https://confluence.atlassian.com/bitbucket/use-docker-images-as-build-environments-792298897.html). To run Playwright tests on Bitbucket, use our public Docker image ([see Dockerfile](./docker.md)).
 
 ```yml
-image: mcr.microsoft.com/playwright:bionic
+image: mcr.microsoft.com/playwright:focal
 ```
 
 While the Docker image supports sandboxing for Chromium, it does not work in the Bitbucket Pipelines environment. To launch Chromium on Bitbucket Pipelines, use the `chromiumSandbox: false` launch argument.
@@ -189,6 +253,44 @@ While the Docker image supports sandboxing for Chromium, it does not work in the
 ```js
 const { chromium } = require('playwright');
 const browser = await chromium.launch({ chromiumSandbox: false });
+```
+
+```java
+import com.microsoft.playwright.*;
+
+public class Example {
+  public static void main(String[] args) {
+    try (Playwright playwright = Playwright.create()) {
+      BrowserType chromium = playwright.chromium();
+      Browser browser = chromium.launch(new BrowserType.LaunchOptions().setChromiumSandbox(false));
+    }
+  }
+}
+```
+
+```python async
+browser = await playwright.chromium.launch(chromium_sandbox=False)
+```
+
+```python sync
+browser = playwright.chromium.launch(chromium_sandbox=False)
+```
+
+```csharp
+using Microsoft.Playwright;
+using System.Threading.Tasks;
+
+class Program
+{
+    public static async Task Main()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+        {
+            ChromiumSandbox = false
+        });
+    }
+}
 ```
 
 ### GitLab CI
@@ -201,22 +303,21 @@ stages:
 
 tests:
   stage: test
-  image: mcr.microsoft.com/playwright:bionic
+  image: mcr.microsoft.com/playwright:focal
   script:
-    - npm install # This should install playwright
-    - npm run test
+  ...
 ```
 
 ## Caching browsers
 
 By default, Playwright downloads browser binaries when the Playwright NPM package
 is installed. The NPM packages have a `postinstall` hook that downloads the browser
-binaries. This behavior can be [customized with environment variables](./installation.md).
+binaries. This behavior can be [customized with environment variables](./library.md#managing-browser-binaries).
 
 Caching browsers on CI is **strictly optional**: The `postinstall` hooks should
 execute and download the browser binaries on every run.
 
-#### Exception: `node_modules` are cached
+#### Exception: `node_modules` are cached (Node-specific)
 
 Most CI providers cache the [npm-cache](https://docs.npmjs.com/cli-commands/cache.html)
 directory (located at `$HOME/.npm`). If your CI pipelines caches the `node_modules`
@@ -232,7 +333,7 @@ This behavior can be fixed with one of the following approaches:
    behavior in most CI providers.)
 1. Set `PLAYWRIGHT_BROWSERS_PATH=0` as the environment variable before running
    `npm install`. This will download the browser binaries in the `node_modules`
-   directory and cache them with the package code. See [installation docs](./installation.md).
+   directory and cache them with the package code. See [managing browser binaries](./library.md#managing-browser-binaries).
 1. Use `npm ci` (instead of `npm install`) which forces a clean install: by
    removing the existing `node_modules` directory. See [npm docs](https://docs.npmjs.com/cli/ci.html).
 1. Cache the browser binaries, with the steps below.
@@ -253,11 +354,14 @@ configuration, against a hash of the Playwright version.
 
 Playwright supports the `DEBUG` environment variable to output debug logs during execution. Setting it to `pw:browser*` is helpful while debugging `Error: Failed to launch browser` errors.
 
-```
+```bash js
 DEBUG=pw:browser* npm run test
 ```
+```bash python
+DEBUG=pw:browser* pytest
+```
 
-## Running headful
+## Running headed
 
 By default, Playwright launches browsers in headless mode. This can be changed by passing a flag when the browser is launched.
 
@@ -267,8 +371,62 @@ const { chromium } = require('playwright');
 const browser = await chromium.launch({ headless: false });
 ```
 
-On Linux agents, headful execution requires [Xvfb](https://en.wikipedia.org/wiki/Xvfb) to be installed. Our [Docker image](./docker.md) and GitHub Action have Xvfb pre-installed. To run browsers in headful mode with Xvfb, add `xvfb-run` before the Node.js command.
+```java
+// Works across chromium, firefox and webkit
+import com.microsoft.playwright.*;
 
+public class Example {
+  public static void main(String[] args) {
+    try (Playwright playwright = Playwright.create()) {
+      BrowserType chromium = playwright.chromium();
+      Browser browser = chromium.launch(new BrowserType.LaunchOptions().setHeadless(false));
+    }
+  }
+}
 ```
+
+```python async
+import asyncio
+from playwright.async_api import async_playwright
+
+async def main():
+    async with async_playwright() as p:
+         # Works across chromium, firefox and webkit
+         browser = await p.chromium.launch(headless=False)
+
+asyncio.run(main())
+```
+
+```python sync
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+   # Works across chromium, firefox and webkit
+   browser = p.chromium.launch(headless=False)
+```
+
+```csharp
+using Microsoft.Playwright;
+using System.Threading.Tasks;
+
+class Program
+{
+    public static async Task Main()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+        {
+            Headless = false
+        });
+    }
+}
+```
+
+On Linux agents, headed execution requires [Xvfb](https://en.wikipedia.org/wiki/Xvfb) to be installed. Our [Docker image](./docker.md) and GitHub Action have Xvfb pre-installed. To run browsers in headed mode with Xvfb, add `xvfb-run` before the Node.js command.
+
+```bash js
 xvfb-run node index.js
+```
+```bash python
+xvfb-run python test.py
 ```

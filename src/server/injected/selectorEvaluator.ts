@@ -15,6 +15,7 @@
  */
 
 import { CSSComplexSelector, CSSSimpleSelector, CSSComplexSelectorList, CSSFunctionArgument } from '../common/cssParser';
+import { customCSSNames } from '../common/selectorParser';
 
 export type QueryContext = {
   scope: Element | Document;
@@ -42,9 +43,11 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
   private _cacheCallMatches: QueryCache = new Map();
   private _cacheCallQuery: QueryCache = new Map();
   private _cacheQuerySimple: QueryCache = new Map();
+  _cacheText = new Map<Element | ShadowRoot, ElementText>();
+  private _scoreMap: Map<Element, number> | undefined;
+  private _retainCacheCounter = 0;
 
   constructor(extraEngines: Map<string, SelectorEngine>) {
-    // Note: keep predefined names in sync with Selectors class.
     for (const [name, engine] of extraEngines)
       this._engines.set(name, engine);
     this._engines.set('not', notEngine);
@@ -57,24 +60,39 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
     this._engines.set('text', textEngine);
     this._engines.set('text-is', textIsEngine);
     this._engines.set('text-matches', textMatchesEngine);
-    this._engines.set('xpath', xpathEngine);
-    for (const attr of ['id', 'data-testid', 'data-test-id', 'data-test'])
-      this._engines.set(attr, createAttributeEngine(attr));
+    this._engines.set('has-text', hasTextEngine);
+    this._engines.set('right-of', createPositionEngine('right-of', boxRightOf));
+    this._engines.set('left-of', createPositionEngine('left-of', boxLeftOf));
+    this._engines.set('above', createPositionEngine('above', boxAbove));
+    this._engines.set('below', createPositionEngine('below', boxBelow));
+    this._engines.set('near', createPositionEngine('near', boxNear));
+    this._engines.set('nth-match', nthMatchEngine);
+
+    const allNames = [...this._engines.keys()];
+    allNames.sort();
+    const parserNames = [...customCSSNames];
+    parserNames.sort();
+    if (allNames.join('|') !== parserNames.join('|'))
+      throw new Error(`Please keep customCSSNames in sync with evaluator engines: ${allNames.join('|')} vs ${parserNames.join('|')}`);
   }
 
-  // This is the only function we should use for querying, because it does
-  // the right thing with caching.
-  evaluate(context: QueryContext, s: CSSComplexSelectorList): Element[] {
-    const result = this.query(context, s);
-    this._cacheQueryCSS.clear();
-    this._cacheMatches.clear();
-    this._cacheQuery.clear();
-    this._cacheMatchesSimple.clear();
-    this._cacheMatchesParents.clear();
-    this._cacheCallMatches.clear();
-    this._cacheCallQuery.clear();
-    this._cacheQuerySimple.clear();
-    return result;
+  begin() {
+    ++this._retainCacheCounter;
+  }
+
+  end() {
+    --this._retainCacheCounter;
+    if (!this._retainCacheCounter) {
+      this._cacheQueryCSS.clear();
+      this._cacheMatches.clear();
+      this._cacheQuery.clear();
+      this._cacheMatchesSimple.clear();
+      this._cacheMatchesParents.clear();
+      this._cacheCallMatches.clear();
+      this._cacheCallQuery.clear();
+      this._cacheQuerySimple.clear();
+      this._cacheText.clear();
+    }
   }
 
   private _cached<T>(cache: QueryCache, main: any, rest: any[], cb: () => T): T {
@@ -99,27 +117,64 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
 
   matches(element: Element, s: Selector, context: QueryContext): boolean {
     const selector = this._checkSelector(s);
-    return this._cached<boolean>(this._cacheMatches, element, [selector, context], () => {
-      if (Array.isArray(selector))
-        return this._matchesEngine(isEngine, element, selector, context);
-      if (!this._matchesSimple(element, selector.simples[selector.simples.length - 1].selector, context))
-        return false;
-      return this._matchesParents(element, selector, selector.simples.length - 2, context);
-    });
+    this.begin();
+    try {
+      return this._cached<boolean>(this._cacheMatches, element, [selector, context.scope, context.pierceShadow], () => {
+        if (Array.isArray(selector))
+          return this._matchesEngine(isEngine, element, selector, context);
+        if (!this._matchesSimple(element, selector.simples[selector.simples.length - 1].selector, context))
+          return false;
+        return this._matchesParents(element, selector, selector.simples.length - 2, context);
+      });
+    } finally {
+      this.end();
+    }
   }
 
   query(context: QueryContext, s: any): Element[] {
     const selector = this._checkSelector(s);
-    return this._cached<Element[]>(this._cacheQuery, selector, [context], () => {
-      if (Array.isArray(selector))
-        return this._queryEngine(isEngine, context, selector);
-      const elements = this._querySimple(context, selector.simples[selector.simples.length - 1].selector);
-      return elements.filter(element => this._matchesParents(element, selector, selector.simples.length - 2, context));
-    });
+    this.begin();
+    try {
+      return this._cached<Element[]>(this._cacheQuery, selector, [context.scope, context.pierceShadow], () => {
+        if (Array.isArray(selector))
+          return this._queryEngine(isEngine, context, selector);
+
+        // query() recursively calls itself, so we set up a new map for this particular query() call.
+        const previousScoreMap = this._scoreMap;
+        this._scoreMap = new Map();
+        let elements = this._querySimple(context, selector.simples[selector.simples.length - 1].selector);
+        elements = elements.filter(element => this._matchesParents(element, selector, selector.simples.length - 2, context));
+        if (this._scoreMap.size) {
+          elements.sort((a, b) => {
+            const aScore = this._scoreMap!.get(a);
+            const bScore = this._scoreMap!.get(b);
+            if (aScore === bScore)
+              return 0;
+            if (aScore === undefined)
+              return 1;
+            if (bScore === undefined)
+              return -1;
+            return aScore - bScore;
+          });
+        }
+        this._scoreMap = previousScoreMap;
+
+        return elements;
+      });
+    } finally {
+      this.end();
+    }
+  }
+
+  _markScore(element: Element, score: number) {
+    // HACK ALERT: temporary marks an element with a score, to be used
+    // for sorting at the end of the query().
+    if (this._scoreMap)
+      this._scoreMap.set(element, score);
   }
 
   private _matchesSimple(element: Element, simple: CSSSimpleSelector, context: QueryContext): boolean {
-    return this._cached<boolean>(this._cacheMatchesSimple, element, [simple, context], () => {
+    return this._cached<boolean>(this._cacheMatchesSimple, element, [simple, context.scope, context.pierceShadow], () => {
       const isPossiblyScopeClause = simple.functions.some(f => f.name === 'scope' || f.name === 'is');
       if (!isPossiblyScopeClause && element === context.scope)
         return false;
@@ -137,7 +192,7 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
     if (!simple.functions.length)
       return this._queryCSS(context, simple.css || '*');
 
-    return this._cached<Element[]>(this._cacheQuerySimple, simple, [context], () => {
+    return this._cached<Element[]>(this._cacheQuerySimple, simple, [context.scope, context.pierceShadow], () => {
       let css = simple.css;
       const funcs = simple.functions;
       if (css === '*' && funcs.length)
@@ -174,7 +229,7 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
   private _matchesParents(element: Element, complex: CSSComplexSelector, index: number, context: QueryContext): boolean {
     if (index < 0)
       return true;
-    return this._cached<boolean>(this._cacheMatchesParents, element, [complex, index, context], () => {
+    return this._cached<boolean>(this._cacheMatchesParents, element, [complex, index, context.scope, context.pierceShadow], () => {
       const { selector: simple, combinator } = complex.simples[index];
       if (combinator === '>') {
         const parent = parentElementOrShadowHostInContext(element, context);
@@ -248,13 +303,13 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
   }
 
   private _callMatches(engine: SelectorEngine, element: Element, args: CSSFunctionArgument[], context: QueryContext): boolean {
-    return this._cached<boolean>(this._cacheCallMatches, element, [engine, args, context.scope, context.pierceShadow], () => {
+    return this._cached<boolean>(this._cacheCallMatches, element, [engine, context.scope, context.pierceShadow, ...args], () => {
       return engine.matches!(element, args, context, this);
     });
   }
 
   private _callQuery(engine: SelectorEngine, args: CSSFunctionArgument[], context: QueryContext): Element[] {
-    return this._cached<Element[]>(this._cacheCallQuery, args, [engine, context.scope, context.pierceShadow], () => {
+    return this._cached<Element[]>(this._cacheCallQuery, engine, [context.scope, context.pierceShadow, ...args], () => {
       return engine.query!(context, args, this);
     });
   }
@@ -264,7 +319,7 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
   }
 
   _queryCSS(context: QueryContext, css: string): Element[] {
-    return this._cached<Element[]>(this._cacheQueryCSS, css, [context], () => {
+    return this._cached<Element[]>(this._cacheQueryCSS, css, [context.scope, context.pierceShadow], () => {
       let result: Element[] = [];
       function query(root: Element | ShadowRoot | Document) {
         result = result.concat([...root.querySelectorAll(css)]);
@@ -370,17 +425,19 @@ const visibleEngine: SelectorEngine = {
 
 const textEngine: SelectorEngine = {
   matches(element: Element, args: (string | number | Selector)[], context: QueryContext, evaluator: SelectorEvaluator): boolean {
-    if (args.length === 0 || typeof args[0] !== 'string')
+    if (args.length !== 1 || typeof args[0] !== 'string')
       throw new Error(`"text" engine expects a single string`);
-    return elementMatchesText(element, context, textMatcher(args[0], true));
+    const matcher = createLaxTextMatcher(args[0]);
+    return elementMatchesText(evaluator as SelectorEvaluatorImpl, element, matcher) === 'self';
   },
 };
 
 const textIsEngine: SelectorEngine = {
   matches(element: Element, args: (string | number | Selector)[], context: QueryContext, evaluator: SelectorEvaluator): boolean {
-    if (args.length === 0 || typeof args[0] !== 'string')
+    if (args.length !== 1 || typeof args[0] !== 'string')
       throw new Error(`"text-is" engine expects a single string`);
-    return elementMatchesText(element, context, textMatcher(args[0], false));
+    const matcher = createStrictTextMatcher(args[0]);
+    return elementMatchesText(evaluator as SelectorEvaluatorImpl, element, matcher) !== 'none';
   },
 };
 
@@ -388,72 +445,177 @@ const textMatchesEngine: SelectorEngine = {
   matches(element: Element, args: (string | number | Selector)[], context: QueryContext, evaluator: SelectorEvaluator): boolean {
     if (args.length === 0 || typeof args[0] !== 'string' || args.length > 2 || (args.length === 2 && typeof args[1] !== 'string'))
       throw new Error(`"text-matches" engine expects a regexp body and optional regexp flags`);
-    const re = new RegExp(args[0], args.length === 2 ? args[1] : undefined);
-    return elementMatchesText(element, context, s => re.test(s));
+    const matcher = createRegexTextMatcher(args[0], args.length === 2 ? args[1] : undefined);
+    return elementMatchesText(evaluator as SelectorEvaluatorImpl, element, matcher) === 'self';
   },
 };
 
-function textMatcher(text: string, substring: boolean): (s: string) => boolean {
-  text = text.trim().replace(/\s+/g, ' ');
-  text = text.toLowerCase();
-  return (s: string) => {
-    s = s.trim().replace(/\s+/g, ' ');
-    s = s.toLowerCase();
-    return substring ? s.includes(text) : s === text;
+const hasTextEngine: SelectorEngine = {
+  matches(element: Element, args: (string | number | Selector)[], context: QueryContext, evaluator: SelectorEvaluator): boolean {
+    if (args.length !== 1 || typeof args[0] !== 'string')
+      throw new Error(`"has-text" engine expects a single string`);
+    if (shouldSkipForTextMatching(element))
+      return false;
+    const matcher = createLaxTextMatcher(args[0]);
+    return matcher(elementText(evaluator as SelectorEvaluatorImpl, element));
+  },
+};
+
+export function createLaxTextMatcher(text: string): TextMatcher {
+  text = text.trim().replace(/\s+/g, ' ').toLowerCase();
+  return (elementText: ElementText) => {
+    const s = elementText.full.trim().replace(/\s+/g, ' ').toLowerCase();
+    return s.includes(text);
   };
 }
 
-function elementMatchesText(element: Element, context: QueryContext, matcher: (s: string) => boolean) {
-  if (element.nodeName === 'SCRIPT' || element.nodeName === 'STYLE' || document.head && document.head.contains(element))
-    return false;
-  if ((element instanceof HTMLInputElement) && (element.type === 'submit' || element.type === 'button') && matcher(element.value))
-    return true;
-  let lastText = '';
-  for (let child = element.firstChild; child; child = child.nextSibling) {
-    if (child.nodeType === 3 /* Node.TEXT_NODE */) {
-      lastText += child.nodeValue;
-    } else {
-      if (lastText && matcher(lastText))
-        return true;
-      lastText = '';
-    }
-  }
-  return !!lastText && matcher(lastText);
+export function createStrictTextMatcher(text: string): TextMatcher {
+  text = text.trim().replace(/\s+/g, ' ');
+  return (elementText: ElementText) => {
+    return elementText.immediate.some(s => s.trim().replace(/\s+/g, ' ') === text);
+  };
 }
 
-const xpathEngine: SelectorEngine = {
-  query(context: QueryContext, args: (string | number | Selector)[], evaluator: SelectorEvaluator): Element[] {
-    if (args.length !== 1 || typeof args[0] !== 'string')
-      throw new Error(`"xpath" engine expects a single string`);
-    const document = context.scope.nodeType === 9 /* Node.DOCUMENT_NODE */ ? context.scope as Document : context.scope.ownerDocument;
-    if (!document)
-      return [];
-    const result: Element[] = [];
-    const it = document.evaluate(args[0], context.scope, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE);
-    for (let node = it.iterateNext(); node; node = it.iterateNext()) {
-      if (node.nodeType === 1 /* Node.ELEMENT_NODE */)
-        result.push(node as Element);
-    }
-    return result;
-  },
-};
+export function createRegexTextMatcher(source: string, flags?: string): TextMatcher {
+  const re = new RegExp(source, flags);
+  return (elementText: ElementText) => {
+    return re.test(elementText.full);
+  };
+}
 
-function createAttributeEngine(attr: string): SelectorEngine {
+function shouldSkipForTextMatching(element: Element | ShadowRoot) {
+  return element.nodeName === 'SCRIPT' || element.nodeName === 'STYLE' || document.head && document.head.contains(element);
+}
+
+export type ElementText = { full: string, immediate: string[] };
+export type TextMatcher = (text: ElementText) => boolean;
+
+export function elementText(evaluator: SelectorEvaluatorImpl, root: Element | ShadowRoot): ElementText {
+  let value = evaluator._cacheText.get(root);
+  if (value === undefined) {
+    value = { full: '', immediate: [] };
+    if (!shouldSkipForTextMatching(root)) {
+      let currentImmediate = '';
+      if ((root instanceof HTMLInputElement) && (root.type === 'submit' || root.type === 'button')) {
+        value = { full: root.value, immediate: [root.value] };
+      } else {
+        for (let child = root.firstChild; child; child = child.nextSibling) {
+          if (child.nodeType === Node.TEXT_NODE) {
+            value.full += child.nodeValue || '';
+            currentImmediate += child.nodeValue || '';
+          } else {
+            if (currentImmediate)
+              value.immediate.push(currentImmediate);
+            currentImmediate = '';
+            if (child.nodeType === Node.ELEMENT_NODE)
+              value.full += elementText(evaluator, child as Element).full;
+          }
+        }
+        if (currentImmediate)
+          value.immediate.push(currentImmediate);
+        if ((root as Element).shadowRoot)
+          value.full += elementText(evaluator, (root as Element).shadowRoot!).full;
+      }
+    }
+    evaluator._cacheText.set(root, value);
+  }
+  return value;
+}
+
+export function elementMatchesText(evaluator: SelectorEvaluatorImpl, element: Element, matcher: TextMatcher): 'none' | 'self' | 'selfAndChildren' {
+  if (shouldSkipForTextMatching(element))
+    return 'none';
+  if (!matcher(elementText(evaluator, element)))
+    return 'none';
+  for (let child = element.firstChild; child; child = child.nextSibling) {
+    if (child.nodeType === Node.ELEMENT_NODE && matcher(elementText(evaluator, child as Element)))
+      return 'selfAndChildren';
+  }
+  if (element.shadowRoot && matcher(elementText(evaluator, element.shadowRoot)))
+    return 'selfAndChildren';
+  return 'self';
+}
+
+function boxRightOf(box1: DOMRect, box2: DOMRect, maxDistance: number | undefined): number | undefined {
+  const distance = box1.left - box2.right;
+  if (distance < 0 || (maxDistance !== undefined && distance > maxDistance))
+    return;
+  return distance + Math.max(box2.bottom - box1.bottom, 0) + Math.max(box1.top - box2.top, 0);
+}
+
+function boxLeftOf(box1: DOMRect, box2: DOMRect, maxDistance: number | undefined): number | undefined {
+  const distance = box2.left - box1.right;
+  if (distance < 0 || (maxDistance !== undefined && distance > maxDistance))
+    return;
+  return distance + Math.max(box2.bottom - box1.bottom, 0) + Math.max(box1.top - box2.top, 0);
+}
+
+function boxAbove(box1: DOMRect, box2: DOMRect, maxDistance: number | undefined): number | undefined {
+  const distance = box2.top - box1.bottom;
+  if (distance < 0 || (maxDistance !== undefined && distance > maxDistance))
+    return;
+  return distance + Math.max(box1.left - box2.left, 0) + Math.max(box2.right - box1.right, 0);
+}
+
+function boxBelow(box1: DOMRect, box2: DOMRect, maxDistance: number | undefined): number | undefined {
+  const distance = box1.top - box2.bottom;
+  if (distance < 0 || (maxDistance !== undefined && distance > maxDistance))
+    return;
+  return distance + Math.max(box1.left - box2.left, 0) + Math.max(box2.right - box1.right, 0);
+}
+
+function boxNear(box1: DOMRect, box2: DOMRect, maxDistance: number | undefined): number | undefined {
+  const kThreshold = maxDistance === undefined ? 50 : maxDistance;
+  let score = 0;
+  if (box1.left - box2.right >= 0)
+    score += box1.left - box2.right;
+  if (box2.left - box1.right >= 0)
+    score += box2.left - box1.right;
+  if (box2.top - box1.bottom >= 0)
+    score += box2.top - box1.bottom;
+  if (box1.top - box2.bottom >= 0)
+    score += box1.top - box2.bottom;
+  return score > kThreshold ? undefined : score;
+}
+
+function createPositionEngine(name: string, scorer: (box1: DOMRect, box2: DOMRect, maxDistance: number | undefined) => number | undefined): SelectorEngine {
   return {
     matches(element: Element, args: (string | number | Selector)[], context: QueryContext, evaluator: SelectorEvaluator): boolean {
-      if (args.length === 0 || typeof args[0] !== 'string')
-        throw new Error(`"${attr}" engine expects a single string`);
-      return element.getAttribute(attr) === args[0];
-    },
-
-    query(context: QueryContext, args: (string | number | Selector)[], evaluator: SelectorEvaluator): Element[] {
-      if (args.length !== 1 || typeof args[0] !== 'string')
-        throw new Error(`"${attr}" engine expects a single string`);
-      const css = `[${attr}=${CSS.escape(args[0])}]`;
-      return (evaluator as SelectorEvaluatorImpl)._queryCSS(context, css);
-    },
+      const maxDistance = args.length && typeof args[args.length - 1] === 'number' ? args[args.length - 1] : undefined;
+      const queryArgs = maxDistance === undefined ? args : args.slice(0, args.length - 1);
+      if (args.length < 1 + (maxDistance === undefined ? 0 : 1))
+        throw new Error(`"${name}" engine expects a selector list and optional maximum distance in pixels`);
+      const box = element.getBoundingClientRect();
+      let bestScore: number | undefined;
+      for (const e of evaluator.query(context, queryArgs)) {
+        if (e === element)
+          continue;
+        const score = scorer(box, e.getBoundingClientRect(), maxDistance);
+        if (score === undefined)
+          continue;
+        if (bestScore === undefined || score < bestScore)
+          bestScore = score;
+      }
+      if (bestScore === undefined)
+        return false;
+      (evaluator as SelectorEvaluatorImpl)._markScore(element, bestScore);
+      return true;
+    }
   };
 }
+
+const nthMatchEngine: SelectorEngine = {
+  query(context: QueryContext, args: (string | number | Selector)[], evaluator: SelectorEvaluator): Element[] {
+    let index = args[args.length - 1];
+    if (args.length < 2)
+      throw new Error(`"nth-match" engine expects non-empty selector list and an index argument`);
+    if (typeof index !== 'number' || index < 1)
+      throw new Error(`"nth-match" engine expects a one-based index as the last argument`);
+    const elements = isEngine.query!(context, args.slice(0, args.length - 1), evaluator);
+    index--;  // one-based
+    return index < elements.length ? [elements[index]] : [];
+  },
+};
 
 export function parentElementOrShadowHost(element: Element): Element | undefined {
   if (element.parentElement)

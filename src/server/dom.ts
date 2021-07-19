@@ -14,16 +14,20 @@
  * limitations under the License.
  */
 
+import * as channels from '../protocol/channels';
 import * as frames from './frames';
-import { assert } from '../utils/utils';
-import type { InjectedScript, InjectedScriptPoll } from './injected/injectedScript';
+import type { ElementStateWithoutStable, InjectedScript, InjectedScriptPoll } from './injected/injectedScript';
 import * as injectedScriptSource from '../generated/injectedScriptSource';
 import * as js from './javascript';
+import * as mime from 'mime';
 import { Page } from './page';
 import { SelectorInfo } from './selectors';
 import * as types from './types';
-import { Progress, ProgressController, runAbortableTask } from './progress';
+import { Progress, ProgressController } from './progress';
 import { FatalDOMError, RetargetableDOMError } from './common/domErrors';
+import { CallMetadata } from './instrumentation';
+
+type SetInputFilesFiles = channels.ElementHandleSetInputFilesParams['files'];
 
 export class FrameExecutionContext extends js.ExecutionContext {
   readonly frame: frames.Frame;
@@ -31,9 +35,13 @@ export class FrameExecutionContext extends js.ExecutionContext {
   readonly world: types.World | null;
 
   constructor(delegate: js.ExecutionContextDelegate, frame: frames.Frame, world: types.World|null) {
-    super(delegate);
+    super(frame, delegate);
     this.frame = frame;
     this.world = world;
+  }
+
+  async waitForSignalsCreatedBy<T>(action: () => Promise<T>): Promise<T> {
+    return this.frame._page._frameManager.waitForSignalsCreatedBy(null, false, action);
   }
 
   adoptIfNeeded(handle: js.JSHandle): Promise<js.JSHandle> | null {
@@ -42,31 +50,33 @@ export class FrameExecutionContext extends js.ExecutionContext {
     return null;
   }
 
-  async evaluateInternal<R>(pageFunction: js.Func0<R>): Promise<R>;
-  async evaluateInternal<Arg, R>(pageFunction: js.Func1<Arg, R>, arg: Arg): Promise<R>;
-  async evaluateInternal(pageFunction: never, ...args: never[]): Promise<any> {
+  async evaluate<Arg, R>(pageFunction: js.Func1<Arg, R>, arg?: Arg): Promise<R> {
+    return js.evaluate(this, true /* returnByValue */, pageFunction, arg);
+  }
+
+  async evaluateHandle<Arg, R>(pageFunction: js.Func1<Arg, R>, arg?: Arg): Promise<js.SmartHandle<R>> {
+    return js.evaluate(this, false /* returnByValue */, pageFunction, arg);
+  }
+
+  async evaluateExpression(expression: string, isFunction: boolean | undefined, arg?: any): Promise<any> {
+    return js.evaluateExpression(this, true /* returnByValue */, expression, isFunction, arg);
+  }
+
+  async evaluateAndWaitForSignals<Arg, R>(pageFunction: js.Func1<Arg, R>, arg?: Arg): Promise<R> {
     return await this.frame._page._frameManager.waitForSignalsCreatedBy(null, false /* noWaitFor */, async () => {
-      return js.evaluate(this, true /* returnByValue */, pageFunction, ...args);
+      return this.evaluate(pageFunction, arg);
     });
   }
 
-  async evaluateExpressionInternal(expression: string, isFunction: boolean, ...args: any[]): Promise<any> {
+  async evaluateExpressionAndWaitForSignals(expression: string, isFunction: boolean | undefined, arg?: any): Promise<any> {
     return await this.frame._page._frameManager.waitForSignalsCreatedBy(null, false /* noWaitFor */, async () => {
-      return js.evaluateExpression(this, true /* returnByValue */, expression, isFunction, ...args);
+      return this.evaluateExpression(expression, isFunction, arg);
     });
   }
 
-  async evaluateHandleInternal<R>(pageFunction: js.Func0<R>): Promise<js.SmartHandle<R>>;
-  async evaluateHandleInternal<Arg, R>(pageFunction: js.Func1<Arg, R>, arg: Arg): Promise<js.SmartHandle<R>>;
-  async evaluateHandleInternal(pageFunction: never, ...args: never[]): Promise<any> {
+  async evaluateExpressionHandleAndWaitForSignals(expression: string, isFunction: boolean | undefined, arg: any): Promise<any> {
     return await this.frame._page._frameManager.waitForSignalsCreatedBy(null, false /* noWaitFor */, async () => {
-      return js.evaluate(this, false /* returnByValue */, pageFunction, ...args);
-    });
-  }
-
-  async evaluateExpressionHandleInternal(expression: string, isFunction: boolean, ...args: any[]): Promise<any> {
-    return await this.frame._page._frameManager.waitForSignalsCreatedBy(null, false /* noWaitFor */, async () => {
-      return js.evaluateExpression(this, false /* returnByValue */, expression, isFunction, ...args);
+      return js.evaluateExpression(this, false /* returnByValue */, expression, isFunction, arg);
     });
   }
 
@@ -82,11 +92,16 @@ export class FrameExecutionContext extends js.ExecutionContext {
       for (const [name, { source }] of this.frame._page.selectors._engines)
         custom.push(`{ name: '${name}', engine: (${source}) }`);
       const source = `
-        new (${injectedScriptSource.source})([
-          ${custom.join(',\n')}
-        ])
+        (() => {
+        ${injectedScriptSource.source}
+        return new pwExport(
+          ${this.frame._page._delegate.rafCountForStablePosition()},
+          ${!!process.env.PWTEST_USE_TIMEOUT_FOR_RAF},
+          [${custom.join(',\n')}]
+        );
+        })();
       `;
-      this._injectedScriptPromise = this._delegate.rawEvaluate(source).then(objectId => new js.JSHandle(this, 'object', objectId));
+      this._injectedScriptPromise = this._delegate.rawEvaluateHandle(source).then(objectId => new js.JSHandle(this, 'object', objectId));
     }
     return this._injectedScriptPromise;
   }
@@ -118,19 +133,19 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     return this;
   }
 
-  async _evaluateInMain<R, Arg>(pageFunction: js.Func1<[js.JSHandle<InjectedScript>, ElementHandle<T>, Arg], R>, arg: Arg): Promise<R> {
+  private async _evaluateInMainAndWaitForSignals<R, Arg>(pageFunction: js.Func1<[js.JSHandle<InjectedScript>, ElementHandle<T>, Arg], R>, arg: Arg): Promise<R> {
     const main = await this._context.frame._mainContext();
-    return main.evaluateInternal(pageFunction, [await main.injectedScript(), this, arg]);
+    return main.evaluateAndWaitForSignals(pageFunction, [await main.injectedScript(), this, arg]);
   }
 
-  async _evaluateInUtility<R, Arg>(pageFunction: js.Func1<[js.JSHandle<InjectedScript>, ElementHandle<T>, Arg], R>, arg: Arg): Promise<R> {
+  async evaluateInUtility<R, Arg>(pageFunction: js.Func1<[js.JSHandle<InjectedScript>, ElementHandle<T>, Arg], R>, arg: Arg): Promise<R> {
     const utility = await this._context.frame._utilityContext();
-    return utility.evaluateInternal(pageFunction, [await utility.injectedScript(), this, arg]);
+    return utility.evaluate(pageFunction, [await utility.injectedScript(), this, arg]);
   }
 
-  async _evaluateHandleInUtility<R, Arg>(pageFunction: js.Func1<[js.JSHandle<InjectedScript>, ElementHandle<T>, Arg], R>, arg: Arg): Promise<js.JSHandle<R>> {
+  async evaluateHandleInUtility<R, Arg>(pageFunction: js.Func1<[js.JSHandle<InjectedScript>, ElementHandle<T>, Arg], R>, arg: Arg): Promise<js.JSHandle<R>> {
     const utility = await this._context.frame._utilityContext();
-    return utility.evaluateHandleInternal(pageFunction, [await utility.injectedScript(), this, arg]);
+    return utility.evaluateHandle(pageFunction, [await utility.injectedScript(), this, arg]);
   }
 
   async ownerFrame(): Promise<frames.Frame | null> {
@@ -149,14 +164,14 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
   }
 
   async contentFrame(): Promise<frames.Frame | null> {
-    const isFrameElement = await this._evaluateInUtility(([injected, node]) => node && (node.nodeName === 'IFRAME' || node.nodeName === 'FRAME'), {});
+    const isFrameElement = await this.evaluateInUtility(([injected, node]) => node && (node.nodeName === 'IFRAME' || node.nodeName === 'FRAME'), {});
     if (!isFrameElement)
       return null;
     return this._page._delegate.getContentFrame(this);
   }
 
   async getAttribute(name: string): Promise<string | null> {
-    return throwFatalDOMError(await this._evaluateInUtility(([injeced, node, name]) => {
+    return throwFatalDOMError(await this.evaluateInUtility(([injeced, node, name]) => {
       if (node.nodeType !== Node.ELEMENT_NODE)
         return 'error:notelement';
       const element = node as unknown as Element;
@@ -164,12 +179,21 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     }, name)).value;
   }
 
+  async inputValue(): Promise<string> {
+    return throwFatalDOMError(await this.evaluateInUtility(([injeced, node]) => {
+      if (node.nodeType !== Node.ELEMENT_NODE || (node.nodeName !== 'INPUT' && node.nodeName !== 'TEXTAREA'))
+        return 'error:notinputvalue';
+      const element = node as unknown as (HTMLInputElement | HTMLTextAreaElement);
+      return { value: element.value };
+    }, undefined)).value;
+  }
+
   async textContent(): Promise<string | null> {
-    return this._evaluateInUtility(([injected, node]) => node.textContent, {});
+    return this.evaluateInUtility(([injected, node]) => node.textContent, {});
   }
 
   async innerText(): Promise<string> {
-    return throwFatalDOMError(await this._evaluateInUtility(([injected, node]) => {
+    return throwFatalDOMError(await this.evaluateInUtility(([injected, node]) => {
       if (node.nodeType !== Node.ELEMENT_NODE)
         return 'error:notelement';
       if (node.namespaceURI !== 'http://www.w3.org/1999/xhtml')
@@ -180,7 +204,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
   }
 
   async innerHTML(): Promise<string> {
-    return throwFatalDOMError(await this._evaluateInUtility(([injected, node]) => {
+    return throwFatalDOMError(await this.evaluateInUtility(([injected, node]) => {
       if (node.nodeType !== Node.ELEMENT_NODE)
         return 'error:notelement';
       const element = node as unknown as Element;
@@ -189,7 +213,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
   }
 
   async dispatchEvent(type: string, eventInit: Object = {}) {
-    await this._evaluateInMain(([injected, node, { type, eventInit }]) =>
+    await this._evaluateInMainAndWaitForSignals(([injected, node, { type, eventInit }]) =>
       injected.dispatchEvent(node, type, eventInit), { type, eventInit });
     await this._page._doSlowMo();
   }
@@ -200,7 +224,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
 
   async _waitAndScrollIntoViewIfNeeded(progress: Progress): Promise<void> {
     while (progress.isRunning()) {
-      assertDone(throwRetargetableDOMError(await this._waitForDisplayedAtStablePosition(progress, false /* waitForEnabled */)));
+      assertDone(throwRetargetableDOMError(await this._waitForDisplayedAtStablePosition(progress, false /* force */, false /* waitForEnabled */)));
 
       progress.throwIfAborted();  // Avoid action that has side-effects.
       const result = throwRetargetableDOMError(await this._scrollRectIntoViewIfNeeded());
@@ -211,8 +235,9 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     }
   }
 
-  async scrollIntoViewIfNeeded(options: types.TimeoutOptions = {}) {
-    return runAbortableTask(
+  async scrollIntoViewIfNeeded(metadata: CallMetadata, options: types.TimeoutOptions = {}) {
+    const controller = new ProgressController(metadata, this);
+    return controller.run(
         progress => this._waitAndScrollIntoViewIfNeeded(progress),
         this._page._timeoutSettings.timeout(options));
   }
@@ -239,7 +264,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
 
     const [quads, metrics] = await Promise.all([
       this._page._delegate.getContentQuads(this),
-      this._page.mainFrame()._utilityContext().then(utility => utility.evaluateInternal(() => ({width: innerWidth, height: innerHeight}))),
+      this._page.mainFrame()._utilityContext().then(utility => utility.evaluate(() => ({width: innerWidth, height: innerHeight}))),
     ] as const);
     if (!quads || !quads.length)
       return 'error:notvisible';
@@ -261,7 +286,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
   private async _offsetPoint(offset: types.Point): Promise<types.Point | 'error:notvisible'> {
     const [box, border] = await Promise.all([
       this.boundingBox(),
-      this._evaluateInUtility(([injected, node]) => injected.getElementBorderWidth(node), {}).catch(e => {}),
+      this.evaluateInUtility(([injected, node]) => injected.getElementBorderWidth(node), {}).catch(e => {}),
     ]);
     if (!box || !border)
       return 'error:notvisible';
@@ -291,14 +316,14 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
 
     while (progress.isRunning()) {
       if (retry) {
-        progress.log(`retrying ${actionName} action, attempt #${retry}`);
+        progress.log(`retrying ${actionName} action${options.trial ? ' (trial run)' : ''}, attempt #${retry}`);
         const timeout = waitTime[Math.min(retry - 1, waitTime.length - 1)];
         if (timeout) {
           progress.log(`  waiting ${timeout}ms`);
-          await this._evaluateInUtility(([injected, node, timeout]) => new Promise(f => setTimeout(f, timeout)), timeout);
+          await this.evaluateInUtility(([injected, node, timeout]) => new Promise(f => setTimeout(f, timeout)), timeout);
         }
       } else {
-        progress.log(`attempting ${actionName} action`);
+        progress.log(`attempting ${actionName} action${options.trial ? ' (trial run)' : ''}`);
       }
       const forceScrollOptions = scrollOptions[retry % scrollOptions.length];
       const result = await this._performPointerAction(progress, actionName, waitForEnabled, action, forceScrollOptions, options);
@@ -330,18 +355,16 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     const { force = false, position } = options;
     if ((options as any).__testHookBeforeStable)
       await (options as any).__testHookBeforeStable();
-    if (!force) {
-      const result = await this._waitForDisplayedAtStablePosition(progress, waitForEnabled);
-      if (result !== 'done')
-        return result;
-    }
+    const result = await this._waitForDisplayedAtStablePosition(progress, force, waitForEnabled);
+    if (result !== 'done')
+      return result;
     if ((options as any).__testHookAfterStable)
       await (options as any).__testHookAfterStable();
 
     progress.log('  scrolling into view if needed');
     progress.throwIfAborted();  // Avoid action that has side-effects.
     if (forceScrollOptions) {
-      await this._evaluateInUtility(([injected, node, options]) => {
+      await this.evaluateInUtility(([injected, node, options]) => {
         if (node.nodeType === 1 /* Node.ELEMENT_NODE */)
           (node as Node as Element).scrollIntoView(options);
       }, forceScrollOptions);
@@ -367,6 +390,13 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
       progress.log(`  element does receive pointer events`);
     }
 
+    progress.metadata.point = point;
+    if (options.trial)  {
+      progress.log(`  trial ${actionName} has finished`);
+      return 'done';
+    }
+
+    await progress.beforeInputAction(this);
     await this._page._frameManager.waitForSignalsCreatedBy(progress, options.noWaitAfter, async () => {
       if ((options as any).__testHookBeforePointerAction)
         await (options as any).__testHookBeforePointerAction();
@@ -388,7 +418,8 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     return 'done';
   }
 
-  async hover(controller: ProgressController, options: types.PointerActionOptions & types.PointerActionWaitOptions): Promise<void> {
+  async hover(metadata: CallMetadata, options: types.PointerActionOptions & types.PointerActionWaitOptions): Promise<void> {
+    const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       const result = await this._hover(progress, options);
       return assertDone(throwRetargetableDOMError(result));
@@ -399,7 +430,8 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     return this._retryPointerAction(progress, 'hover', false /* waitForEnabled */, point => this._page.mouse.move(point.x, point.y), options);
   }
 
-  async click(controller: ProgressController, options: types.MouseClickOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}): Promise<void> {
+  async click(metadata: CallMetadata, options: types.MouseClickOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}): Promise<void> {
+    const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       const result = await this._click(progress, options);
       return assertDone(throwRetargetableDOMError(result));
@@ -410,7 +442,8 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     return this._retryPointerAction(progress, 'click', true /* waitForEnabled */, point => this._page.mouse.click(point.x, point.y, options), options);
   }
 
-  async dblclick(controller: ProgressController, options: types.MouseMultiClickOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions): Promise<void> {
+  async dblclick(metadata: CallMetadata, options: types.MouseMultiClickOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions): Promise<void> {
+    const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       const result = await this._dblclick(progress, options);
       return assertDone(throwRetargetableDOMError(result));
@@ -421,7 +454,8 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     return this._retryPointerAction(progress, 'dblclick', true /* waitForEnabled */, point => this._page.mouse.dblclick(point.x, point.y, options), options);
   }
 
-  async tap(controller: ProgressController, options: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}): Promise<void> {
+  async tap(metadata: CallMetadata, options: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}): Promise<void> {
+    const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       const result = await this._tap(progress, options);
       return assertDone(throwRetargetableDOMError(result));
@@ -432,37 +466,46 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     return this._retryPointerAction(progress, 'tap', true /* waitForEnabled */, point => this._page.touchscreen.tap(point.x, point.y), options);
   }
 
-  async selectOption(controller: ProgressController, elements: ElementHandle[], values: types.SelectOption[], options: types.NavigatingActionWaitOptions): Promise<string[]> {
+  async selectOption(metadata: CallMetadata, elements: ElementHandle[], values: types.SelectOption[], options: types.NavigatingActionWaitOptions & types.ForceOptions): Promise<string[]> {
+    const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       const result = await this._selectOption(progress, elements, values, options);
       return throwRetargetableDOMError(result);
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async _selectOption(progress: Progress, elements: ElementHandle[], values: types.SelectOption[], options: types.NavigatingActionWaitOptions): Promise<string[] | 'error:notconnected'> {
-    const selectOptions = [...elements, ...values];
+  async _selectOption(progress: Progress, elements: ElementHandle[], values: types.SelectOption[], options: types.NavigatingActionWaitOptions & types.ForceOptions): Promise<string[] | 'error:notconnected'> {
+    const optionsToSelect = [...elements, ...values];
+    await progress.beforeInputAction(this);
     return this._page._frameManager.waitForSignalsCreatedBy(progress, options.noWaitAfter, async () => {
       progress.throwIfAborted();  // Avoid action that has side-effects.
-      const value = await this._evaluateInUtility(([injected, node, selectOptions]) => injected.selectOptions(node, selectOptions), selectOptions);
+      progress.log('  selecting specified option(s)');
+      const poll = await this.evaluateHandleInUtility(([injected, node, { optionsToSelect, force }]) => {
+        return injected.waitForElementStatesAndPerformAction(node, ['visible', 'enabled'], force, injected.selectOptions.bind(injected, optionsToSelect));
+      }, { optionsToSelect, force: options.force });
+      const pollHandler = new InjectedScriptPollHandler(progress, poll);
+      const result = throwFatalDOMError(await pollHandler.finish());
       await this._page._doSlowMo();
-      return throwFatalDOMError(value);
+      return result;
     });
   }
 
-  async fill(controller: ProgressController, value: string, options: types.NavigatingActionWaitOptions = {}): Promise<void> {
+  async fill(metadata: CallMetadata, value: string, options: types.NavigatingActionWaitOptions & types.ForceOptions = {}): Promise<void> {
+    const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       const result = await this._fill(progress, value, options);
       assertDone(throwRetargetableDOMError(result));
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async _fill(progress: Progress, value: string, options: types.NavigatingActionWaitOptions): Promise<'error:notconnected' | 'done'> {
+  async _fill(progress: Progress, value: string, options: types.NavigatingActionWaitOptions & types.ForceOptions): Promise<'error:notconnected' | 'done'> {
     progress.log(`elementHandle.fill("${value}")`);
+    await progress.beforeInputAction(this);
     return this._page._frameManager.waitForSignalsCreatedBy(progress, options.noWaitAfter, async () => {
       progress.log('  waiting for element to be visible, enabled and editable');
-      const poll = await this._evaluateHandleInUtility(([injected, node, value]) => {
-        return injected.waitForEnabledAndFill(node, value);
-      }, value);
+      const poll = await this.evaluateHandleInUtility(([injected, node, { value, force }]) => {
+        return injected.waitForElementStatesAndPerformAction(node, ['visible', 'enabled', 'editable'], force, injected.fill.bind(injected, value));
+      }, { value, force: options.force });
       const pollHandler = new InjectedScriptPollHandler(progress, poll);
       const filled = throwFatalDOMError(await pollHandler.finish());
       progress.throwIfAborted();  // Avoid action that has side-effects.
@@ -482,47 +525,56 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     }, 'input');
   }
 
-  async selectText(options: types.TimeoutOptions = {}): Promise<void> {
-    return runAbortableTask(async progress => {
+  async selectText(metadata: CallMetadata, options: types.TimeoutOptions & types.ForceOptions = {}): Promise<void> {
+    const controller = new ProgressController(metadata, this);
+    return controller.run(async progress => {
       progress.throwIfAborted();  // Avoid action that has side-effects.
-      const poll = await this._evaluateHandleInUtility(([injected, node]) => {
-        return injected.waitForVisibleAndSelectText(node);
-      }, {});
+      const poll = await this.evaluateHandleInUtility(([injected, node, force]) => {
+        return injected.waitForElementStatesAndPerformAction(node, ['visible'], force, injected.selectText.bind(injected));
+      }, options.force);
       const pollHandler = new InjectedScriptPollHandler(progress, poll);
       const result = throwFatalDOMError(await pollHandler.finish());
       assertDone(throwRetargetableDOMError(result));
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async setInputFiles(controller: ProgressController, files: types.FilePayload[], options: types.NavigatingActionWaitOptions) {
+  async setInputFiles(metadata: CallMetadata, files: SetInputFilesFiles, options: types.NavigatingActionWaitOptions) {
+    const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       const result = await this._setInputFiles(progress, files, options);
       return assertDone(throwRetargetableDOMError(result));
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async _setInputFiles(progress: Progress, files: types.FilePayload[], options: types.NavigatingActionWaitOptions): Promise<'error:notconnected' | 'done'> {
-    const multiple = throwFatalDOMError(await this._evaluateInUtility(([injected, node]): 'error:notinput' | 'error:notconnected' | boolean => {
-      if (node.nodeType !== Node.ELEMENT_NODE || (node as Node as Element).tagName !== 'INPUT')
-        return 'error:notinput';
-      if (!node.isConnected)
+  async _setInputFiles(progress: Progress, files: SetInputFilesFiles, options: types.NavigatingActionWaitOptions): Promise<'error:notconnected' | 'done'> {
+    for (const payload of files) {
+      if (!payload.mimeType)
+        payload.mimeType = mime.getType(payload.name) || 'application/octet-stream';
+    }
+    const retargeted = await this.evaluateHandleInUtility(([injected, node, multiple]): FatalDOMError | 'error:notconnected' | Element => {
+      const element = injected.retarget(node, 'follow-label');
+      if (!element)
         return 'error:notconnected';
-      const input = node as Node as HTMLInputElement;
-      return input.multiple;
-    }, {}));
-    if (typeof multiple === 'string')
-      return multiple;
-    assert(multiple || files.length <= 1, 'Non-multiple file input can only accept single file!');
+      if (element.tagName !== 'INPUT')
+        return 'error:notinput';
+      if (multiple && !(element as HTMLInputElement).multiple)
+        return 'error:notmultiplefileinput';
+      return element;
+    }, files.length > 1);
+    if (!retargeted._objectId)
+      return throwFatalDOMError(retargeted.rawValue() as FatalDOMError | 'error:notconnected');
+    await progress.beforeInputAction(this);
     await this._page._frameManager.waitForSignalsCreatedBy(progress, options.noWaitAfter, async () => {
       progress.throwIfAborted();  // Avoid action that has side-effects.
-      await this._page._delegate.setInputFiles(this as any as ElementHandle<HTMLInputElement>, files);
+      await this._page._delegate.setInputFiles(retargeted as ElementHandle<HTMLInputElement>, files as types.FilePayload[]);
     });
     await this._page._doSlowMo();
     return 'done';
   }
 
-  async focus(): Promise<void> {
-    await runAbortableTask(async progress => {
+  async focus(metadata: CallMetadata): Promise<void> {
+    const controller = new ProgressController(metadata, this);
+    await controller.run(async progress => {
       const result = await this._focus(progress);
       await this._page._doSlowMo();
       return assertDone(throwRetargetableDOMError(result));
@@ -531,11 +583,12 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
 
   async _focus(progress: Progress, resetSelectionIfNotFocused?: boolean): Promise<'error:notconnected' | 'done'> {
     progress.throwIfAborted();  // Avoid action that has side-effects.
-    const result = await this._evaluateInUtility(([injected, node, resetSelectionIfNotFocused]) => injected.focusNode(node, resetSelectionIfNotFocused), resetSelectionIfNotFocused);
+    const result = await this.evaluateInUtility(([injected, node, resetSelectionIfNotFocused]) => injected.focusNode(node, resetSelectionIfNotFocused), resetSelectionIfNotFocused);
     return throwFatalDOMError(result);
   }
 
-  async type(controller: ProgressController, text: string, options: { delay?: number } & types.NavigatingActionWaitOptions): Promise<void> {
+  async type(metadata: CallMetadata, text: string, options: { delay?: number } & types.NavigatingActionWaitOptions): Promise<void> {
+    const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       const result = await this._type(progress, text, options);
       return assertDone(throwRetargetableDOMError(result));
@@ -544,6 +597,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
 
   async _type(progress: Progress, text: string, options: { delay?: number } & types.NavigatingActionWaitOptions): Promise<'error:notconnected' | 'done'> {
     progress.log(`elementHandle.type("${text}")`);
+    await progress.beforeInputAction(this);
     return this._page._frameManager.waitForSignalsCreatedBy(progress, options.noWaitAfter, async () => {
       const result = await this._focus(progress, true /* resetSelectionIfNotFocused */);
       if (result !== 'done')
@@ -554,7 +608,8 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     }, 'input');
   }
 
-  async press(controller: ProgressController, key: string, options: { delay?: number } & types.NavigatingActionWaitOptions): Promise<void> {
+  async press(metadata: CallMetadata, key: string, options: { delay?: number } & types.NavigatingActionWaitOptions): Promise<void> {
+    const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       const result = await this._press(progress, key, options);
       return assertDone(throwRetargetableDOMError(result));
@@ -563,6 +618,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
 
   async _press(progress: Progress, key: string, options: { delay?: number } & types.NavigatingActionWaitOptions): Promise<'error:notconnected' | 'done'> {
     progress.log(`elementHandle.press("${key}")`);
+    await progress.beforeInputAction(this);
     return this._page._frameManager.waitForSignalsCreatedBy(progress, options.noWaitAfter, async () => {
       const result = await this._focus(progress, true /* resetSelectionIfNotFocused */);
       if (result !== 'done')
@@ -573,28 +629,36 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     }, 'input');
   }
 
-  async check(controller: ProgressController, options: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions) {
+  async check(metadata: CallMetadata, options: { position?: types.Point } & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions) {
+    const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       const result = await this._setChecked(progress, true, options);
       return assertDone(throwRetargetableDOMError(result));
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async uncheck(controller: ProgressController, options: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions) {
+  async uncheck(metadata: CallMetadata, options: { position?: types.Point } & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions) {
+    const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       const result = await this._setChecked(progress, false, options);
       return assertDone(throwRetargetableDOMError(result));
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async _setChecked(progress: Progress, state: boolean, options: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions): Promise<'error:notconnected' | 'done'> {
-    if (await this._evaluateInUtility(([injected, node]) => injected.isCheckboxChecked(node), {}) === state)
+  async _setChecked(progress: Progress, state: boolean, options: { position?: types.Point } & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions): Promise<'error:notconnected' | 'done'> {
+    const isChecked = async () => {
+      const result = await this.evaluateInUtility(([injected, node]) => injected.checkElementState(node, 'checked'), {});
+      return throwRetargetableDOMError(throwFatalDOMError(result));
+    };
+    if (await isChecked() === state)
       return 'done';
     const result = await this._click(progress, options);
     if (result !== 'done')
       return result;
-    if (await this._evaluateInUtility(([injected, node]) => injected.isCheckboxChecked(node), {}) !== state)
-      throw new Error('Unable to click checkbox');
+    if (options.trial)
+      return 'done';
+    if (await isChecked() !== state)
+      throw new Error('Clicking the checkbox did not change its state');
     return 'done';
   }
 
@@ -602,8 +666,9 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     return this._page._delegate.getBoundingBox(this);
   }
 
-  async screenshot(options: types.ElementScreenshotOptions = {}): Promise<Buffer> {
-    return runAbortableTask(
+  async screenshot(metadata: CallMetadata, options: types.ElementScreenshotOptions = {}): Promise<Buffer> {
+    const controller = new ProgressController(metadata, this);
+    return controller.run(
         progress => this._page._screenshotter.screenshotElement(progress, this, options),
         this._page._timeoutSettings.timeout(options));
   }
@@ -616,77 +681,72 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     return this._page.selectors._queryAll(this._context.frame, selector, this, true /* adoptToMain */);
   }
 
-  async _$evalExpression(selector: string, expression: string, isFunction: boolean, arg: any): Promise<any> {
+  async evalOnSelectorAndWaitForSignals(selector: string, expression: string, isFunction: boolean | undefined, arg: any): Promise<any> {
     const handle = await this._page.selectors._query(this._context.frame, selector, this);
     if (!handle)
       throw new Error(`Error: failed to find element matching selector "${selector}"`);
-    const result = await handle._evaluateExpression(expression, isFunction, true, arg);
+    const result = await handle.evaluateExpressionAndWaitForSignals(expression, isFunction, true, arg);
     handle.dispose();
     return result;
   }
 
-  async _$$evalExpression(selector: string, expression: string, isFunction: boolean, arg: any): Promise<any> {
+  async evalOnSelectorAllAndWaitForSignals(selector: string, expression: string, isFunction: boolean | undefined, arg: any): Promise<any> {
     const arrayHandle = await this._page.selectors._queryArray(this._context.frame, selector, this);
-    const result = await arrayHandle._evaluateExpression(expression, isFunction, true, arg);
+    const result = await arrayHandle.evaluateExpressionAndWaitForSignals(expression, isFunction, true, arg);
     arrayHandle.dispose();
     return result;
   }
 
-  async waitForElementState(state: 'visible' | 'hidden' | 'stable' | 'enabled' | 'disabled', options: types.TimeoutOptions = {}): Promise<void> {
-    return runAbortableTask(async progress => {
+  async isVisible(): Promise<boolean> {
+    const result = await this.evaluateInUtility(([injected, node]) => injected.checkElementState(node, 'visible'), {});
+    return throwRetargetableDOMError(throwFatalDOMError(result));
+  }
+
+  async isHidden(): Promise<boolean> {
+    const result = await this.evaluateInUtility(([injected, node]) => injected.checkElementState(node, 'hidden'), {});
+    return throwRetargetableDOMError(throwFatalDOMError(result));
+  }
+
+  async isEnabled(): Promise<boolean> {
+    const result = await this.evaluateInUtility(([injected, node]) => injected.checkElementState(node, 'enabled'), {});
+    return throwRetargetableDOMError(throwFatalDOMError(result));
+  }
+
+  async isDisabled(): Promise<boolean> {
+    const result = await this.evaluateInUtility(([injected, node]) => injected.checkElementState(node, 'disabled'), {});
+    return throwRetargetableDOMError(throwFatalDOMError(result));
+  }
+
+  async isEditable(): Promise<boolean> {
+    const result = await this.evaluateInUtility(([injected, node]) => injected.checkElementState(node, 'editable'), {});
+    return throwRetargetableDOMError(throwFatalDOMError(result));
+  }
+
+  async isChecked(): Promise<boolean> {
+    const result = await this.evaluateInUtility(([injected, node]) => injected.checkElementState(node, 'checked'), {});
+    return throwRetargetableDOMError(throwFatalDOMError(result));
+  }
+
+  async waitForElementState(metadata: CallMetadata, state: 'visible' | 'hidden' | 'stable' | 'enabled' | 'disabled' | 'editable', options: types.TimeoutOptions = {}): Promise<void> {
+    const controller = new ProgressController(metadata, this);
+    return controller.run(async progress => {
       progress.log(`  waiting for element to be ${state}`);
-      if (state === 'visible') {
-        const poll = await this._evaluateHandleInUtility(([injected, node]) => {
-          return injected.waitForNodeVisible(node);
-        }, {});
-        const pollHandler = new InjectedScriptPollHandler(progress, poll);
-        assertDone(throwRetargetableDOMError(await pollHandler.finish()));
-        return;
-      }
-      if (state === 'hidden') {
-        const poll = await this._evaluateHandleInUtility(([injected, node]) => {
-          return injected.waitForNodeHidden(node);
-        }, {});
-        const pollHandler = new InjectedScriptPollHandler(progress, poll);
-        assertDone(await pollHandler.finish());
-        return;
-      }
-      if (state === 'enabled') {
-        const poll = await this._evaluateHandleInUtility(([injected, node]) => {
-          return injected.waitForNodeEnabled(node);
-        }, {});
-        const pollHandler = new InjectedScriptPollHandler(progress, poll);
-        assertDone(throwRetargetableDOMError(await pollHandler.finish()));
-        return;
-      }
-      if (state === 'disabled') {
-        const poll = await this._evaluateHandleInUtility(([injected, node]) => {
-          return injected.waitForNodeDisabled(node);
-        }, {});
-        const pollHandler = new InjectedScriptPollHandler(progress, poll);
-        assertDone(throwRetargetableDOMError(await pollHandler.finish()));
-        return;
-      }
-      if (state === 'stable') {
-        const rafCount = this._page._delegate.rafCountForStablePosition();
-        const poll = await this._evaluateHandleInUtility(([injected, node, rafOptions]) => {
-          return injected.waitForDisplayedAtStablePosition(node, rafOptions, false /* waitForEnabled */);
-        }, { rafCount, useTimeout: !!process.env.PW_USE_TIMEOUT_FOR_RAF });
-        const pollHandler = new InjectedScriptPollHandler(progress, poll);
-        assertDone(throwRetargetableDOMError(await pollHandler.finish()));
-        return;
-      }
-      throw new Error(`state: expected one of (visible|hidden|stable|enabled)`);
+      const poll = await this.evaluateHandleInUtility(([injected, node, state]) => {
+        return injected.waitForElementStatesAndPerformAction(node, [state], false, () => 'done' as const);
+      }, state);
+      const pollHandler = new InjectedScriptPollHandler(progress, poll);
+      assertDone(throwRetargetableDOMError(throwFatalDOMError(await pollHandler.finish())));
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async waitForSelector(selector: string, options: types.WaitForElementOptions = {}): Promise<ElementHandle<Element> | null> {
+  async waitForSelector(metadata: CallMetadata, selector: string, options: types.WaitForElementOptions = {}): Promise<ElementHandle<Element> | null> {
     const { state = 'visible' } = options;
     if (!['attached', 'detached', 'visible', 'hidden'].includes(state))
       throw new Error(`state: expected one of (attached|detached|visible|hidden)`);
     const info = this._page.selectors._parseSelector(selector);
     const task = waitForSelectorTask(info, state, this);
-    return runAbortableTask(async progress => {
+    const controller = new ProgressController(metadata, this);
+    return controller.run(async progress => {
       progress.log(`waiting for selector "${selector}"${state === 'attached' ? '' : ' to be ' + state}`);
       const context = await this._context.frame._context(info.world);
       const injected = await context.injectedScript();
@@ -710,22 +770,22 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     return this;
   }
 
-  async _waitForDisplayedAtStablePosition(progress: Progress, waitForEnabled: boolean): Promise<'error:notconnected' | 'done'> {
+  async _waitForDisplayedAtStablePosition(progress: Progress, force: boolean, waitForEnabled: boolean): Promise<'error:notconnected' | 'done'> {
     if (waitForEnabled)
-      progress.log(`  waiting for element to be visible, enabled and not moving`);
+      progress.log(`  waiting for element to be visible, enabled and stable`);
     else
-      progress.log(`  waiting for element to be visible and not moving`);
-    const rafCount = this._page._delegate.rafCountForStablePosition();
-    const poll = this._evaluateHandleInUtility(([injected, node, { rafOptions, waitForEnabled }]) => {
-      return injected.waitForDisplayedAtStablePosition(node, rafOptions, waitForEnabled);
-    }, { rafOptions: { rafCount, useTimeout: !!process.env.PW_USE_TIMEOUT_FOR_RAF }, waitForEnabled });
+      progress.log(`  waiting for element to be visible and stable`);
+    const poll = this.evaluateHandleInUtility(([injected, node, { waitForEnabled, force }]) => {
+      return injected.waitForElementStatesAndPerformAction(node,
+          waitForEnabled ? ['visible', 'stable', 'enabled'] : ['visible', 'stable'], force, () => 'done' as const);
+    }, { waitForEnabled, force });
     const pollHandler = new InjectedScriptPollHandler(progress, await poll);
     const result = await pollHandler.finish();
     if (waitForEnabled)
-      progress.log('  element is visible, enabled and does not move');
+      progress.log('  element is visible, enabled and stable');
     else
-      progress.log('  element is visible and does not move');
-    return result;
+      progress.log('  element is visible and stable');
+    return throwFatalDOMError(result);
   }
 
   async _checkHitTargetAt(point: types.Point): Promise<'error:notconnected' | { hitTargetDescription: string } | 'done'> {
@@ -738,7 +798,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
       // Translate from viewport coordinates to frame coordinates.
       point = { x: point.x - box.x, y: point.y - box.y };
     }
-    return this._evaluateInUtility(([injected, node, point]) => injected.checkHitTargetAt(node, point), point);
+    return this.evaluateInUtility(([injected, node, point]) => injected.checkHitTargetAt(node, point), point);
   }
 }
 
@@ -771,7 +831,7 @@ export class InjectedScriptPollHandler<T> {
 
   async finishHandle(): Promise<js.SmartHandle<T>> {
     try {
-      const result = await this._poll!.evaluateHandle(poll => poll.result);
+      const result = await this._poll!.evaluateHandle(poll => poll.run());
       await this._finishInternal();
       return result;
     } finally {
@@ -781,7 +841,7 @@ export class InjectedScriptPollHandler<T> {
 
   async finish(): Promise<T> {
     try {
-      const result = await this._poll!.evaluate(poll => poll.result);
+      const result = await this._poll!.evaluate(poll => poll.run());
       await this._finishInternal();
       return result;
     } finally {
@@ -823,12 +883,18 @@ export function throwFatalDOMError<T>(result: T | FatalDOMError): T {
     throw new Error(`Malformed value`);
   if (result === 'error:notinput')
     throw new Error('Node is not an HTMLInputElement');
+  if (result === 'error:notinputvalue')
+    throw new Error('Node is not an HTMLInputElement or HTMLTextAreaElement');
   if (result === 'error:notselect')
     throw new Error('Element is not a <select> element.');
+  if (result === 'error:notcheckbox')
+    throw new Error('Not a checkbox or radio button');
+  if (result === 'error:notmultiplefileinput')
+    throw new Error('Non-multiple file input can only accept single file');
   return result;
 }
 
-function throwRetargetableDOMError<T>(result: T | RetargetableDOMError): T {
+export function throwRetargetableDOMError<T>(result: T | RetargetableDOMError): T {
   if (result === 'error:notconnected')
     throw new Error('Element is not attached to the DOM');
   return result;
@@ -872,15 +938,19 @@ export function waitForSelectorTask(selector: SelectorInfo, state: 'attached' | 
     let lastElement: Element | undefined;
 
     return injected.pollRaf((progress, continuePolling) => {
-      const element = injected.querySelector(parsed, root || document);
+      const elements = injected.querySelectorAll(parsed, root || document);
+      const element = elements[0];
       const visible = element ? injected.isVisible(element) : false;
 
       if (lastElement !== element) {
         lastElement = element;
-        if (!element)
+        if (!element) {
           progress.log(`  selector did not resolve to any element`);
-        else
+        } else {
+          if (elements.length > 1)
+            progress.log(`  selector resolved to ${elements.length} elements. Proceeding with the first one.`);
           progress.log(`  selector resolved to ${visible ? 'visible' : 'hidden'} ${injected.previewNode(element)}`);
+        }
       }
 
       switch (state) {
@@ -958,3 +1028,31 @@ export function getAttributeTask(selector: SelectorInfo, name: string): Schedula
     });
   }, { parsed: selector.parsed, name });
 }
+
+export function inputValueTask(selector: SelectorInfo): SchedulableTask<string> {
+  return injectedScript => injectedScript.evaluateHandle((injected, { parsed }) => {
+    return injected.pollRaf((progress, continuePolling) => {
+      const element = injected.querySelector(parsed, document);
+      if (!element)
+        return continuePolling;
+      progress.log(`  selector resolved to ${injected.previewNode(element)}`);
+      if (element.nodeName !== 'INPUT' && element.nodeName !== 'TEXTAREA')
+        return 'error:notinputvalue';
+      return (element as any).value;
+    });
+  }, { parsed: selector.parsed });
+}
+
+export function elementStateTask(selector: SelectorInfo, state: ElementStateWithoutStable): SchedulableTask<boolean | 'error:notconnected' | FatalDOMError> {
+  return injectedScript => injectedScript.evaluateHandle((injected, { parsed, state }) => {
+    return injected.pollRaf((progress, continuePolling) => {
+      const element = injected.querySelector(parsed, document);
+      if (!element)
+        return continuePolling;
+      progress.log(`  selector resolved to ${injected.previewNode(element)}`);
+      return injected.checkElementState(element, state);
+    });
+  }, { parsed: selector.parsed, state });
+}
+
+export const kUnableToAdoptErrorMessage = 'Unable to adopt element handle from a different document';

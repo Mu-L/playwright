@@ -14,14 +14,12 @@
  * limitations under the License.
  */
 
-import { createAttributeEngine } from './attributeSelectorEngine';
 import { SelectorEngine, SelectorRoot } from './selectorEngine';
-import { createTextSelector } from './textSelectorEngine';
 import { XPathEngine } from './xpathSelectorEngine';
 import { ParsedSelector, ParsedSelectorPart, parseSelector } from '../common/selectorParser';
 import { FatalDOMError } from '../common/domErrors';
-import { SelectorEvaluatorImpl, isVisible, parentElementOrShadowHost } from './selectorEvaluator';
-import { createCSSEngine } from './cssSelectorEngine';
+import { SelectorEvaluatorImpl, isVisible, parentElementOrShadowHost, elementMatchesText, TextMatcher, createRegexTextMatcher, createStrictTextMatcher, createLaxTextMatcher } from './selectorEvaluator';
+import { CSSComplexSelectorList } from '../common/cssParser';
 
 type Predicate<T> = (progress: InjectedScriptProgress, continuePolling: symbol) => T | symbol;
 
@@ -32,7 +30,7 @@ export type InjectedScriptProgress = {
 };
 
 export type InjectedScriptPoll<T> = {
-  result: Promise<T>,
+  run: () => Promise<T>,
   // Takes more logs, waiting until at least one message is available.
   takeNextLogs: () => Promise<string[]>,
   // Takes all current logs without waiting.
@@ -40,31 +38,36 @@ export type InjectedScriptPoll<T> = {
   cancel: () => void,
 };
 
+export type ElementStateWithoutStable = 'visible' | 'hidden' | 'enabled' | 'disabled' | 'editable' | 'checked';
+export type ElementState = ElementStateWithoutStable | 'stable';
+
 export class InjectedScript {
   private _enginesV1: Map<string, SelectorEngine>;
-  private _evaluator: SelectorEvaluatorImpl;
+  _evaluator: SelectorEvaluatorImpl;
+  private _stableRafCount: number;
+  private _replaceRafWithTimeout: boolean;
 
-  constructor(customEngines: { name: string, engine: SelectorEngine}[]) {
+  constructor(stableRafCount: number, replaceRafWithTimeout: boolean, customEngines: { name: string, engine: SelectorEngine}[]) {
     this._enginesV1 = new Map();
-    this._enginesV1.set('css', createCSSEngine(true));
-    this._enginesV1.set('css:light', createCSSEngine(false));
     this._enginesV1.set('xpath', XPathEngine);
     this._enginesV1.set('xpath:light', XPathEngine);
-    this._enginesV1.set('text', createTextSelector(true));
-    this._enginesV1.set('text:light', createTextSelector(false));
-    this._enginesV1.set('id', createAttributeEngine('id', true));
-    this._enginesV1.set('id:light', createAttributeEngine('id', false));
-    this._enginesV1.set('data-testid', createAttributeEngine('data-testid', true));
-    this._enginesV1.set('data-testid:light', createAttributeEngine('data-testid', false));
-    this._enginesV1.set('data-test-id', createAttributeEngine('data-test-id', true));
-    this._enginesV1.set('data-test-id:light', createAttributeEngine('data-test-id', false));
-    this._enginesV1.set('data-test', createAttributeEngine('data-test', true));
-    this._enginesV1.set('data-test:light', createAttributeEngine('data-test', false));
+    this._enginesV1.set('text', this._createTextEngine(true));
+    this._enginesV1.set('text:light', this._createTextEngine(false));
+    this._enginesV1.set('id', this._createAttributeEngine('id', true));
+    this._enginesV1.set('id:light', this._createAttributeEngine('id', false));
+    this._enginesV1.set('data-testid', this._createAttributeEngine('data-testid', true));
+    this._enginesV1.set('data-testid:light', this._createAttributeEngine('data-testid', false));
+    this._enginesV1.set('data-test-id', this._createAttributeEngine('data-test-id', true));
+    this._enginesV1.set('data-test-id:light', this._createAttributeEngine('data-test-id', false));
+    this._enginesV1.set('data-test', this._createAttributeEngine('data-test', true));
+    this._enginesV1.set('data-test:light', this._createAttributeEngine('data-test', false));
     for (const { name, engine } of customEngines)
       this._enginesV1.set(name, engine);
 
     // No custom engines in V2 for now.
     this._evaluator = new SelectorEvaluatorImpl(new Map());
+    this._stableRafCount = stableRafCount;
+    this._replaceRafWithTimeout = replaceRafWithTimeout;
   }
 
   parseSelector(selector: string): ParsedSelector {
@@ -79,7 +82,12 @@ export class InjectedScript {
   querySelector(selector: ParsedSelector, root: Node): Element | undefined {
     if (!(root as any)['querySelector'])
       throw new Error('Node is not queryable.');
-    return this._querySelectorRecursively(root as SelectorRoot, selector, 0);
+    this._evaluator.begin();
+    try {
+      return this._querySelectorRecursively(root as SelectorRoot, selector, 0);
+    } finally {
+      this._evaluator.end();
+    }
   }
 
   private _querySelectorRecursively(root: SelectorRoot, selector: ParsedSelector, index: number): Element | undefined {
@@ -97,44 +105,107 @@ export class InjectedScript {
   querySelectorAll(selector: ParsedSelector, root: Node): Element[] {
     if (!(root as any)['querySelectorAll'])
       throw new Error('Node is not queryable.');
-    const capture = selector.capture === undefined ? selector.parts.length - 1 : selector.capture;
-    // Query all elements up to the capture.
-    const partsToQueryAll = selector.parts.slice(0, capture + 1);
-    // Check they have a descendant matching everything after the capture.
-    const partsToCheckOne = selector.parts.slice(capture + 1);
-    let set = new Set<SelectorRoot>([ root as SelectorRoot ]);
-    for (const part of partsToQueryAll) {
-      const newSet = new Set<Element>();
-      for (const prev of set) {
-        for (const next of this._queryEngineAll(part, prev)) {
-          if (newSet.has(next))
-            continue;
-          newSet.add(next);
+    this._evaluator.begin();
+    try {
+      const capture = selector.capture === undefined ? selector.parts.length - 1 : selector.capture;
+      // Query all elements up to the capture.
+      const partsToQueryAll = selector.parts.slice(0, capture + 1);
+      // Check they have a descendant matching everything after the capture.
+      const partsToCheckOne = selector.parts.slice(capture + 1);
+      let set = new Set<SelectorRoot>([ root as SelectorRoot ]);
+      for (const part of partsToQueryAll) {
+        const newSet = new Set<Element>();
+        for (const prev of set) {
+          for (const next of this._queryEngineAll(part, prev)) {
+            if (newSet.has(next))
+              continue;
+            newSet.add(next);
+          }
         }
+        set = newSet;
       }
-      set = newSet;
+      let result = [...set] as Element[];
+      if (partsToCheckOne.length) {
+        const partial = { parts: partsToCheckOne };
+        result = result.filter(e => !!this._querySelectorRecursively(e, partial, 0));
+      }
+      return result;
+    } finally {
+      this._evaluator.end();
     }
-    const candidates = Array.from(set) as Element[];
-    if (!partsToCheckOne.length)
-      return candidates;
-    const partial = { parts: partsToCheckOne };
-    return candidates.filter(e => !!this._querySelectorRecursively(e, partial, 0));
   }
 
   private _queryEngine(part: ParsedSelectorPart, root: SelectorRoot): Element | undefined {
     if (Array.isArray(part))
-      return this._evaluator.evaluate({ scope: root as Document | Element, pierceShadow: true }, part)[0];
+      return this._evaluator.query({ scope: root as Document | Element, pierceShadow: true }, part)[0];
     return this._enginesV1.get(part.name)!.query(root, part.body);
   }
 
   private _queryEngineAll(part: ParsedSelectorPart, root: SelectorRoot): Element[] {
     if (Array.isArray(part))
-      return this._evaluator.evaluate({ scope: root as Document | Element, pierceShadow: true }, part);
+      return this._evaluator.query({ scope: root as Document | Element, pierceShadow: true }, part);
     return this._enginesV1.get(part.name)!.queryAll(root, part.body);
   }
 
+  private _createAttributeEngine(attribute: string, shadow: boolean): SelectorEngine {
+    const toCSS = (selector: string): CSSComplexSelectorList => {
+      const css = `[${attribute}=${JSON.stringify(selector)}]`;
+      return [{ simples: [{ selector: { css, functions: [] }, combinator: '' }] }];
+    };
+    return {
+      query: (root: SelectorRoot, selector: string): Element | undefined => {
+        return this._evaluator.query({ scope: root as Document | Element, pierceShadow: shadow }, toCSS(selector))[0];
+      },
+      queryAll: (root: SelectorRoot, selector: string): Element[] => {
+        return this._evaluator.query({ scope: root as Document | Element, pierceShadow: shadow }, toCSS(selector));
+      }
+    };
+  }
+
+  private _createTextEngine(shadow: boolean): SelectorEngine {
+    const queryList = (root: SelectorRoot, selector: string, single: boolean): Element[] => {
+      const { matcher, kind } = createTextMatcher(selector);
+      const result: Element[] = [];
+      let lastDidNotMatchSelf: Element | null = null;
+
+      const checkElement = (element: Element) => {
+        // TODO: replace contains() with something shadow-dom-aware?
+        if (kind === 'lax' && lastDidNotMatchSelf && lastDidNotMatchSelf.contains(element))
+          return false;
+        const matches = elementMatchesText(this._evaluator, element, matcher);
+        if (matches === 'none')
+          lastDidNotMatchSelf = element;
+        if (matches === 'self' || (matches === 'selfAndChildren' && kind === 'strict'))
+          result.push(element);
+        return single && result.length > 0;
+      };
+
+      if (root.nodeType === Node.ELEMENT_NODE && checkElement(root as Element))
+        return result;
+      const elements = this._evaluator._queryCSS({ scope: root as Document | Element, pierceShadow: shadow }, '*');
+      for (const element of elements) {
+        if (checkElement(element))
+          return result;
+      }
+      return result;
+    };
+
+    return {
+      query: (root: SelectorRoot, selector: string): Element | undefined => {
+        return queryList(root, selector, true)[0];
+      },
+      queryAll: (root: SelectorRoot, selector: string): Element[] => {
+        return queryList(root, selector, false);
+      }
+    };
+  }
+
   extend(source: string, params: any): any {
-    const constrFunction = global.eval(source);
+    const constrFunction = global.eval(`
+    (() => {
+      ${source}
+      return pwExport;
+    })()`);
     return new constrFunction(this, params);
   }
 
@@ -226,19 +297,23 @@ export class InjectedScript {
       },
     };
 
-    const result = task(progress);
+    const run = () => {
+      const result = task(progress);
 
-    // After the task has finished, there should be no more logs.
-    // Release any pending `takeNextLogs` call, and do not block any future ones.
-    // This prevents non-finished protocol evaluation calls and memory leaks.
-    result.finally(() => {
-      taskFinished = true;
-      logReady();
-    });
+      // After the task has finished, there should be no more logs.
+      // Release any pending `takeNextLogs` call, and do not block any future ones.
+      // This prevents non-finished protocol evaluation calls and memory leaks.
+      result.finally(() => {
+        taskFinished = true;
+        logReady();
+      });
+
+      return result;
+    };
 
     return {
       takeNextLogs,
-      result,
+      run,
       cancel: () => { progress.aborted = true; },
       takeLastLogs: () => unsentLogs,
     };
@@ -251,18 +326,139 @@ export class InjectedScript {
     return { left: parseInt(style.borderLeftWidth || '', 10), top: parseInt(style.borderTopWidth || '', 10) };
   }
 
-  selectOptions(node: Node, optionsToSelect: (Node | { value?: string, label?: string, index?: number })[]): string[] | 'error:notconnected' | FatalDOMError {
-    const element = this.findLabelTarget(node as Element);
-    if (!element || !element.isConnected)
+  retarget(node: Node, behavior: 'follow-label' | 'no-follow-label'): Element | null {
+    let element = node.nodeType === Node.ELEMENT_NODE ? node as Element : node.parentElement;
+    if (!element)
+      return null;
+    if (!element.matches('input, textarea, select'))
+      element = element.closest('button, [role=button], [role=checkbox], [role=radio]') || element;
+    if (behavior === 'follow-label') {
+      if (!element.matches('input, textarea, button, select, [role=button], [role=checkbox], [role=radio]') &&
+          !(element as any).isContentEditable) {
+        // Go up to the label that might be connected to the input/textarea.
+        element = element.closest('label') || element;
+      }
+      if (element.nodeName === 'LABEL')
+        element = (element as HTMLLabelElement).control || element;
+    }
+    return element;
+  }
+
+  waitForElementStatesAndPerformAction<T>(node: Node, states: ElementState[], force: boolean | undefined,
+    callback: (node: Node, progress: InjectedScriptProgress, continuePolling: symbol) => T | symbol): InjectedScriptPoll<T | 'error:notconnected' | FatalDOMError> {
+    let lastRect: { x: number, y: number, width: number, height: number } | undefined;
+    let counter = 0;
+    let samePositionCounter = 0;
+    let lastTime = 0;
+
+    const predicate = (progress: InjectedScriptProgress, continuePolling: symbol) => {
+      if (force) {
+        progress.log(`    forcing action`);
+        return callback(node, progress, continuePolling);
+      }
+
+      for (const state of states) {
+        if (state !== 'stable') {
+          const result = this.checkElementState(node, state);
+          if (typeof result !== 'boolean')
+            return result;
+          if (!result) {
+            progress.logRepeating(`    element is not ${state} - waiting...`);
+            return continuePolling;
+          }
+          continue;
+        }
+
+        const element = this.retarget(node, 'no-follow-label');
+        if (!element)
+          return 'error:notconnected';
+
+        // First raf happens in the same animation frame as evaluation, so it does not produce
+        // any client rect difference compared to synchronous call. We skip the synchronous call
+        // and only force layout during actual rafs as a small optimisation.
+        if (++counter === 1)
+          return continuePolling;
+
+        // Drop frames that are shorter than 16ms - WebKit Win bug.
+        const time = performance.now();
+        if (this._stableRafCount > 1 && time - lastTime < 15)
+          return continuePolling;
+        lastTime = time;
+
+        const clientRect = element.getBoundingClientRect();
+        const rect = { x: clientRect.top, y: clientRect.left, width: clientRect.width, height: clientRect.height };
+        const samePosition = lastRect && rect.x === lastRect.x && rect.y === lastRect.y && rect.width === lastRect.width && rect.height === lastRect.height;
+        if (samePosition)
+          ++samePositionCounter;
+        else
+          samePositionCounter = 0;
+        const isStable = samePositionCounter >= this._stableRafCount;
+        const isStableForLogs = isStable || !lastRect;
+        lastRect = rect;
+        if (!isStableForLogs)
+          progress.logRepeating(`    element is not stable - waiting...`);
+        if (!isStable)
+          return continuePolling;
+      }
+
+      return callback(node, progress, continuePolling);
+    };
+
+    if (this._replaceRafWithTimeout)
+      return this.pollInterval(16, predicate);
+    else
+      return this.pollRaf(predicate);
+  }
+
+  checkElementState(node: Node, state: ElementStateWithoutStable): boolean | 'error:notconnected' | FatalDOMError {
+    const element = this.retarget(node, ['stable', 'visible', 'hidden'].includes(state) ? 'no-follow-label' : 'follow-label');
+    if (!element || !element.isConnected) {
+      if (state === 'hidden')
+        return true;
+      return 'error:notconnected';
+    }
+
+    if (state === 'visible')
+      return this.isVisible(element);
+    if (state === 'hidden')
+      return !this.isVisible(element);
+
+    const disabled = ['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA'].includes(element.nodeName) && element.hasAttribute('disabled');
+    if (state === 'disabled')
+      return disabled;
+    if (state === 'enabled')
+      return !disabled;
+
+    const editable = !(['INPUT', 'TEXTAREA', 'SELECT'].includes(element.nodeName) && element.hasAttribute('readonly'));
+    if (state === 'editable')
+      return !disabled && editable;
+
+    if (state === 'checked') {
+      if (element.getAttribute('role') === 'checkbox')
+        return element.getAttribute('aria-checked') === 'true';
+      if (element.nodeName !== 'INPUT')
+        return 'error:notcheckbox';
+      if (!['radio', 'checkbox'].includes((element as HTMLInputElement).type.toLowerCase()))
+        return 'error:notcheckbox';
+      return (element as HTMLInputElement).checked;
+    }
+    throw new Error(`Unexpected element state "${state}"`);
+  }
+
+  selectOptions(optionsToSelect: (Node | { value?: string, label?: string, index?: number })[],
+    node: Node, progress: InjectedScriptProgress, continuePolling: symbol): string[] | 'error:notconnected' | FatalDOMError | symbol {
+    const element = this.retarget(node, 'follow-label');
+    if (!element)
       return 'error:notconnected';
     if (element.nodeName.toLowerCase() !== 'select')
       return 'error:notselect';
     const select = element as HTMLSelectElement;
-    const options = Array.from(select.options);
-    select.value = undefined as any;
+    const options = [...select.options];
+    const selectedOptions = [];
+    let remainingOptionsToSelect = optionsToSelect.slice();
     for (let index = 0; index < options.length; index++) {
       const option = options[index];
-      option.selected = optionsToSelect.some(optionToSelect => {
+      const filter = (optionToSelect: Node | { value?: string, label?: string, index?: number }) => {
         if (optionToSelect instanceof Node)
           return option === optionToSelect;
         let matches = true;
@@ -273,101 +469,70 @@ export class InjectedScript {
         if (optionToSelect.index !== undefined)
           matches = matches && optionToSelect.index === index;
         return matches;
-      });
-      if (option.selected && !select.multiple)
+      };
+      if (!remainingOptionsToSelect.some(filter))
+        continue;
+      selectedOptions.push(option);
+      if (select.multiple) {
+        remainingOptionsToSelect = remainingOptionsToSelect.filter(o => !filter(o));
+      } else {
+        remainingOptionsToSelect = [];
         break;
+      }
     }
+    if (remainingOptionsToSelect.length) {
+      progress.logRepeating('    did not find some options - waiting... ');
+      return continuePolling;
+    }
+    select.value = undefined as any;
+    selectedOptions.forEach(option => option.selected = true);
+    progress.log('    selected specified option(s)');
     select.dispatchEvent(new Event('input', { 'bubbles': true }));
     select.dispatchEvent(new Event('change', { 'bubbles': true }));
-    return options.filter(option => option.selected).map(option => option.value);
+    return selectedOptions.map(option => option.value);
   }
 
-  waitForEnabledAndFill(node: Node, value: string): InjectedScriptPoll<FatalDOMError | 'error:notconnected' | 'needsinput' | 'done'> {
-    return this.pollRaf((progress, continuePolling) => {
-      if (node.nodeType !== Node.ELEMENT_NODE)
-        return 'error:notelement';
-      const element = this.findLabelTarget(node as Element);
-      if (element && !element.isConnected)
-        return 'error:notconnected';
-      if (!element || !this.isVisible(element)) {
-        progress.logRepeating('    element is not visible - waiting...');
-        return continuePolling;
+  fill(value: string, node: Node, progress: InjectedScriptProgress): FatalDOMError | 'error:notconnected' | 'needsinput' | 'done' {
+    const element = this.retarget(node, 'follow-label');
+    if (!element)
+      return 'error:notconnected';
+    if (element.nodeName.toLowerCase() === 'input') {
+      const input = element as HTMLInputElement;
+      const type = input.type.toLowerCase();
+      const kDateTypes = new Set(['date', 'time', 'datetime', 'datetime-local', 'month', 'week']);
+      const kTextInputTypes = new Set(['', 'email', 'number', 'password', 'search', 'tel', 'text', 'url']);
+      if (!kTextInputTypes.has(type) && !kDateTypes.has(type)) {
+        progress.log(`    input of type "${type}" cannot be filled`);
+        return 'error:notfillableinputtype';
       }
-      if (element.nodeName.toLowerCase() === 'input') {
-        const input = element as HTMLInputElement;
-        const type = input.type.toLowerCase();
-        const kDateTypes = new Set(['date', 'time', 'datetime', 'datetime-local', 'month', 'week']);
-        const kTextInputTypes = new Set(['', 'email', 'number', 'password', 'search', 'tel', 'text', 'url']);
-        if (!kTextInputTypes.has(type) && !kDateTypes.has(type)) {
-          progress.log(`    input of type "${type}" cannot be filled`);
-          return 'error:notfillableinputtype';
-        }
-        if (type === 'number') {
-          value = value.trim();
-          if (isNaN(Number(value)))
-            return 'error:notfillablenumberinput';
-        }
-        if (input.disabled) {
-          progress.logRepeating('    element is disabled - waiting...');
-          return continuePolling;
-        }
-        if (input.readOnly) {
-          progress.logRepeating('    element is readonly - waiting...');
-          return continuePolling;
-        }
-        if (kDateTypes.has(type)) {
-          value = value.trim();
-          input.focus();
-          input.value = value;
-          if (input.value !== value)
-            return 'error:notvaliddate';
-          element.dispatchEvent(new Event('input', { 'bubbles': true }));
-          element.dispatchEvent(new Event('change', { 'bubbles': true }));
-          return 'done';  // We have already changed the value, no need to input it.
-        }
-      } else if (element.nodeName.toLowerCase() === 'textarea') {
-        const textarea = element as HTMLTextAreaElement;
-        if (textarea.disabled) {
-          progress.logRepeating('    element is disabled - waiting...');
-          return continuePolling;
-        }
-        if (textarea.readOnly) {
-          progress.logRepeating('    element is readonly - waiting...');
-          return continuePolling;
-        }
-      } else if (!(element as HTMLElement).isContentEditable) {
-        return 'error:notfillableelement';
+      if (type === 'number') {
+        value = value.trim();
+        if (isNaN(Number(value)))
+          return 'error:notfillablenumberinput';
       }
-      const result = this._selectText(element);
-      if (result === 'error:notvisible') {
-        progress.logRepeating('    element is not visible - waiting...');
-        return continuePolling;
+      if (kDateTypes.has(type)) {
+        value = value.trim();
+        input.focus();
+        input.value = value;
+        if (input.value !== value)
+          return 'error:notvaliddate';
+        element.dispatchEvent(new Event('input', { 'bubbles': true }));
+        element.dispatchEvent(new Event('change', { 'bubbles': true }));
+        return 'done';  // We have already changed the value, no need to input it.
       }
-      return 'needsinput';  // Still need to input the value.
-    });
+    } else if (element.nodeName.toLowerCase() === 'textarea') {
+      // Nothing to check here.
+    } else if (!(element as HTMLElement).isContentEditable) {
+      return 'error:notfillableelement';
+    }
+    this.selectText(element);
+    return 'needsinput';  // Still need to input the value.
   }
 
-  waitForVisibleAndSelectText(node: Node): InjectedScriptPoll<FatalDOMError | 'error:notconnected' | 'done'> {
-    return this.pollRaf((progress, continuePolling) => {
-      if (node.nodeType !== Node.ELEMENT_NODE)
-        return 'error:notelement';
-      if (!node.isConnected)
-        return 'error:notconnected';
-      const element = node as Element;
-      if (!this.isVisible(element)) {
-        progress.logRepeating('    element is not visible - waiting...');
-        return continuePolling;
-      }
-      const result = this._selectText(element);
-      if (result === 'error:notvisible') {
-        progress.logRepeating('    element is not visible - waiting...');
-        return continuePolling;
-      }
-      return result;
-    });
-  }
-
-  private _selectText(element: Element): 'error:notvisible' | 'error:notconnected' | 'done' {
+  selectText(node: Node): 'error:notconnected' | 'done' {
+    const element = this.retarget(node, 'follow-label');
+    if (!element)
+      return 'error:notconnected';
     if (element.nodeName.toLowerCase() === 'input') {
       const input = element as HTMLInputElement;
       input.select();
@@ -384,64 +549,12 @@ export class InjectedScript {
     const range = element.ownerDocument.createRange();
     range.selectNodeContents(element);
     const selection = element.ownerDocument.defaultView!.getSelection();
-    if (!selection)
-      return 'error:notvisible';
-    selection.removeAllRanges();
-    selection.addRange(range);
+    if (selection) {
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
     (element as HTMLElement | SVGElement).focus();
     return 'done';
-  }
-
-  waitForNodeVisible(node: Node): InjectedScriptPoll<'error:notconnected' | 'done'> {
-    return this.pollRaf((progress, continuePolling) => {
-      const element = node.nodeType === Node.ELEMENT_NODE ? node as Element : node.parentElement;
-      if (!node.isConnected || !element)
-        return 'error:notconnected';
-      if (!this.isVisible(element)) {
-        progress.logRepeating('    element is not visible - waiting...');
-        return continuePolling;
-      }
-      return 'done';
-    });
-  }
-
-  waitForNodeHidden(node: Node): InjectedScriptPoll<'done'> {
-    return this.pollRaf((progress, continuePolling) => {
-      const element = node.nodeType === Node.ELEMENT_NODE ? node as Element : node.parentElement;
-      if (!node.isConnected || !element)
-        return 'done';
-      if (this.isVisible(element)) {
-        progress.logRepeating('    element is visible - waiting...');
-        return continuePolling;
-      }
-      return 'done';
-    });
-  }
-
-  waitForNodeEnabled(node: Node): InjectedScriptPoll<'error:notconnected' | 'done'> {
-    return this.pollRaf((progress, continuePolling) => {
-      const element = node.nodeType === Node.ELEMENT_NODE ? node as Element : node.parentElement;
-      if (!node.isConnected || !element)
-        return 'error:notconnected';
-      if (this._isElementDisabled(element)) {
-        progress.logRepeating('    element is not enabled - waiting...');
-        return continuePolling;
-      }
-      return 'done';
-    });
-  }
-
-  waitForNodeDisabled(node: Node): InjectedScriptPoll<'error:notconnected' | 'done'> {
-    return this.pollRaf((progress, continuePolling) => {
-      const element = node.nodeType === Node.ELEMENT_NODE ? node as Element : node.parentElement;
-      if (!node.isConnected || !element)
-        return 'error:notconnected';
-      if (!this._isElementDisabled(element)) {
-        progress.logRepeating('    element is enabled - waiting...');
-        return continuePolling;
-      }
-      return 'done';
-    });
   }
 
   focusNode(node: Node, resetSelectionIfNotFocused?: boolean): FatalDOMError | 'error:notconnected' | 'done' {
@@ -461,24 +574,6 @@ export class InjectedScript {
       }
     }
     return 'done';
-  }
-
-  findLabelTarget(element: Element): Element | undefined {
-    return element.nodeName === 'LABEL' ? (element as HTMLLabelElement).control || undefined : element;
-  }
-
-  isCheckboxChecked(node: Node) {
-    if (node.nodeType !== Node.ELEMENT_NODE)
-      throw new Error('Not a checkbox or radio button');
-    const element = node as Element;
-    if (element.getAttribute('role') === 'checkbox')
-      return element.getAttribute('aria-checked') === 'true';
-    const input = this.findLabelTarget(element);
-    if (!input || input.nodeName !== 'INPUT')
-      throw new Error('Not a checkbox or radio button');
-    if (!['radio', 'checkbox'].includes((input as HTMLInputElement).type.toLowerCase()))
-      throw new Error('Not a checkbox or radio button');
-    return (input as HTMLInputElement).checked;
   }
 
   setInputFiles(node: Node, payloads: { name: string, mimeType: string, buffer: string }[]) {
@@ -502,66 +597,6 @@ export class InjectedScript {
     input.files = dt.files;
     input.dispatchEvent(new Event('input', { 'bubbles': true }));
     input.dispatchEvent(new Event('change', { 'bubbles': true }));
-  }
-
-  waitForDisplayedAtStablePosition(node: Node, rafOptions: { rafCount: number, useTimeout?: boolean }, waitForEnabled: boolean): InjectedScriptPoll<'error:notconnected' | 'done'> {
-    let lastRect: { x: number, y: number, width: number, height: number } | undefined;
-    let counter = 0;
-    let samePositionCounter = 0;
-    let lastTime = 0;
-
-    const predicate = (progress: InjectedScriptProgress, continuePolling: symbol) => {
-      // First raf happens in the same animation frame as evaluation, so it does not produce
-      // any client rect difference compared to synchronous call. We skip the synchronous call
-      // and only force layout during actual rafs as a small optimisation.
-      if (++counter === 1)
-        return continuePolling;
-
-      if (!node.isConnected)
-        return 'error:notconnected';
-      const element = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
-      if (!element)
-        return 'error:notconnected';
-
-      // Drop frames that are shorter than 16ms - WebKit Win bug.
-      const time = performance.now();
-      if (rafOptions.rafCount > 1 && time - lastTime < 15)
-        return continuePolling;
-      lastTime = time;
-
-      // Note: this logic should be similar to isVisible() to avoid surprises.
-      const clientRect = element.getBoundingClientRect();
-      const rect = { x: clientRect.top, y: clientRect.left, width: clientRect.width, height: clientRect.height };
-      const samePosition = lastRect && rect.x === lastRect.x && rect.y === lastRect.y && rect.width === lastRect.width && rect.height === lastRect.height;
-      const isDisplayed = rect.width > 0 && rect.height > 0;
-      if (samePosition)
-        ++samePositionCounter;
-      else
-        samePositionCounter = 0;
-      const isStable = samePositionCounter >= rafOptions.rafCount;
-      const isStableForLogs = isStable || !lastRect;
-      lastRect = rect;
-
-      const style = element.ownerDocument && element.ownerDocument.defaultView ? element.ownerDocument.defaultView.getComputedStyle(element) : undefined;
-      const isVisible = !!style && style.visibility !== 'hidden';
-
-      const isDisabled = waitForEnabled && this._isElementDisabled(element);
-
-      if (isDisplayed && isStable && isVisible && !isDisabled)
-        return 'done';
-
-      if (!isDisplayed || !isVisible)
-        progress.logRepeating(`    element is not visible - waiting...`);
-      else if (!isStableForLogs)
-        progress.logRepeating(`    element is moving - waiting...`);
-      else if (isDisabled)
-        progress.logRepeating(`    element is disabled - waiting...`);
-      return continuePolling;
-    };
-    if (rafOptions.useTimeout)
-      return this.pollInterval(16, predicate);
-    else
-      return this.pollRaf(predicate);
   }
 
   checkHitTargetAt(node: Node, point: { x: number, y: number }): 'error:notconnected' | 'done' | { hitTargetDescription: string } {
@@ -611,16 +646,14 @@ export class InjectedScript {
     node.dispatchEvent(event);
   }
 
-  private _isElementDisabled(element: Element): boolean {
-    const elementOrButton = element.closest('button, [role=button]') || element;
-    return ['BUTTON', 'INPUT', 'SELECT'].includes(elementOrButton.nodeName) && elementOrButton.hasAttribute('disabled');
-  }
-
   deepElementFromPoint(document: Document, x: number, y: number): Element | undefined {
     let container: Document | ShadowRoot | null = document;
     let element: Element | undefined;
     while (container) {
-      const innerElement = container.elementFromPoint(x, y) as Element | undefined;
+      // elementFromPoint works incorrectly in Chromium (http://crbug.com/1188919),
+      // so we use elementsFromPoint instead.
+      const elements = container.elementsFromPoint(x, y);
+      const innerElement = elements[0] as Element | undefined;
       if (!innerElement || element === innerElement)
         break;
       element = innerElement;
@@ -721,5 +754,37 @@ const eventType = new Map<string, 'mouse'|'keyboard'|'touch'|'pointer'|'focus'|'
   ['dragexit', 'drag'],
   ['drop', 'drag'],
 ]);
+
+function unescape(s: string): string {
+  if (!s.includes('\\'))
+    return s;
+  const r: string[] = [];
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === '\\' && i + 1 < s.length)
+      i++;
+    r.push(s[i++]);
+  }
+  return r.join('');
+}
+
+function createTextMatcher(selector: string): { matcher: TextMatcher, kind: 'regex' | 'strict' | 'lax' } {
+  if (selector[0] === '/' && selector.lastIndexOf('/') > 0) {
+    const lastSlash = selector.lastIndexOf('/');
+    const matcher: TextMatcher = createRegexTextMatcher(selector.substring(1, lastSlash), selector.substring(lastSlash + 1));
+    return { matcher, kind: 'regex' };
+  }
+  let strict = false;
+  if (selector.length > 1 && selector[0] === '"' && selector[selector.length - 1] === '"') {
+    selector = unescape(selector.substring(1, selector.length - 1));
+    strict = true;
+  }
+  if (selector.length > 1 && selector[0] === "'" && selector[selector.length - 1] === "'") {
+    selector = unescape(selector.substring(1, selector.length - 1));
+    strict = true;
+  }
+  const matcher = strict ? createStrictTextMatcher(selector) : createLaxTextMatcher(selector);
+  return { matcher, kind: strict ? 'strict' : 'lax' };
+}
 
 export default InjectedScript;

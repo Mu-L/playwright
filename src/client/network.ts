@@ -18,10 +18,9 @@ import { URLSearchParams } from 'url';
 import * as channels from '../protocol/channels';
 import { ChannelOwner } from './channelOwner';
 import { Frame } from './frame';
-import { Headers, WaitForEventOptions } from './types';
-import * as fs from 'fs';
+import { Headers, RemoteAddr, SecurityDetails, WaitForEventOptions } from './types';
+import fs from 'fs';
 import * as mime from 'mime';
-import * as util from 'util';
 import { isString, headersObjectToArray, headersArrayToObject } from '../utils/utils';
 import { Events } from './events';
 import { Page } from './page';
@@ -113,9 +112,6 @@ export class Request extends ChannelOwner<channels.RequestChannel, channels.Requ
       return null;
 
     const contentType = this.headers()['content-type'];
-    if (!contentType)
-      return null;
-
     if (contentType === 'application/x-www-form-urlencoded') {
       const entries: Record<string, string> = {};
       const parsed = new URLSearchParams(postData);
@@ -124,7 +120,11 @@ export class Request extends ChannelOwner<channels.RequestChannel, channels.Requ
       return entries;
     }
 
-    return JSON.parse(postData);
+    try {
+      return JSON.parse(postData);
+    } catch (e) {
+      throw new Error('POST data is not a valid JSON object: ' + postData);
+    }
   }
 
   headers(): Headers {
@@ -132,7 +132,9 @@ export class Request extends ChannelOwner<channels.RequestChannel, channels.Requ
   }
 
   async response(): Promise<Response | null> {
-    return Response.fromNullable((await this._channel.response()).response);
+    return this._wrapApiCall(async (channel: channels.RequestChannel) => {
+      return Response.fromNullable((await channel.response()).response);
+    });
   }
 
   frame(): Frame {
@@ -168,6 +170,80 @@ export class Request extends ChannelOwner<channels.RequestChannel, channels.Requ
   }
 }
 
+export class InterceptedResponse implements api.Response {
+  private readonly _route: Route;
+  private readonly _initializer: channels.InterceptedResponse;
+  private readonly _request: Request;
+  private readonly _headers: Headers;
+
+  constructor(route: Route, initializer: channels.InterceptedResponse) {
+    this._route = route;
+    this._initializer = initializer;
+    this._headers = headersArrayToObject(initializer.headers, true /* lowerCase */);
+    this._request = Request.from(initializer.request);
+  }
+
+  async securityDetails(): Promise<{ issuer?: string | undefined; protocol?: string | undefined; subjectName?: string | undefined; validFrom?: number | undefined; validTo?: number | undefined; } | null> {
+    return null;
+  }
+
+  async serverAddr(): Promise<{ ipAddress: string; port: number; } | null> {
+    return null;
+  }
+
+  async finished(): Promise<Error | null> {
+    const response = await this._request.response();
+    if (!response)
+      return null;
+    return await response.finished();
+  }
+
+  frame(): api.Frame {
+    return this._request.frame();
+  }
+
+  ok(): boolean {
+    return this._initializer.status === 0 || (this._initializer.status >= 200 && this._initializer.status <= 299);
+  }
+
+  url(): string {
+    return this._request.url();
+  }
+
+  status(): number {
+    return this._initializer.status;
+  }
+
+  statusText(): string {
+    return this._initializer.statusText;
+  }
+
+  headers(): Headers {
+    return { ...this._headers };
+  }
+
+  async body(): Promise<Buffer> {
+    return this._route._responseBody();
+  }
+
+  async text(): Promise<string> {
+    const content = await this.body();
+    return content.toString('utf8');
+  }
+
+  async json(): Promise<object> {
+    const content = await this.text();
+    return JSON.parse(content);
+  }
+
+  request(): Request {
+    return this._request;
+  }
+}
+
+type InterceptResponse = true;
+type NotInterceptResponse = false;
+
 export class Route extends ChannelOwner<channels.RouteChannel, channels.RouteInitializer> implements api.Route {
   static from(route: channels.RouteChannel): Route {
     return (route as any)._object;
@@ -182,53 +258,79 @@ export class Route extends ChannelOwner<channels.RouteChannel, channels.RouteIni
   }
 
   async abort(errorCode?: string) {
-    await this._channel.abort({ errorCode });
-  }
-
-  async fulfill(response: { status?: number, headers?: Headers, contentType?: string, body?: string | Buffer, path?: string }) {
-    let body = '';
-    let isBase64 = false;
-    let length = 0;
-    if (response.path) {
-      const buffer = await util.promisify(fs.readFile)(response.path);
-      body = buffer.toString('base64');
-      isBase64 = true;
-      length = buffer.length;
-    } else if (isString(response.body)) {
-      body = response.body;
-      isBase64 = false;
-      length = Buffer.byteLength(body);
-    } else if (response.body) {
-      body = response.body.toString('base64');
-      isBase64 = true;
-      length = response.body.length;
-    }
-
-    const headers: Headers = {};
-    for (const header of Object.keys(response.headers || {}))
-      headers[header.toLowerCase()] = String(response.headers![header]);
-    if (response.contentType)
-      headers['content-type'] = String(response.contentType);
-    else if (response.path)
-      headers['content-type'] = mime.getType(response.path) || 'application/octet-stream';
-    if (length && !('content-length' in headers))
-      headers['content-length'] = String(length);
-
-    await this._channel.fulfill({
-      status: response.status || 200,
-      headers: headersObjectToArray(headers),
-      body,
-      isBase64
+    return this._wrapApiCall(async (channel: channels.RouteChannel) => {
+      await channel.abort({ errorCode });
     });
   }
 
-  async continue(overrides: { url?: string, method?: string, headers?: Headers, postData?: string | Buffer } = {}) {
-    const postDataBuffer = isString(overrides.postData) ? Buffer.from(overrides.postData, 'utf8') : overrides.postData;
-    await this._channel.continue({
-      url: overrides.url,
-      method: overrides.method,
-      headers: overrides.headers ? headersObjectToArray(overrides.headers) : undefined,
-      postData: postDataBuffer ? postDataBuffer.toString('base64') : undefined,
+  async fulfill(options: { status?: number, headers?: Headers, contentType?: string, body?: string | Buffer, path?: string } = {}) {
+    return this._wrapApiCall(async (channel: channels.RouteChannel) => {
+      let body = '';
+      let isBase64 = false;
+      let length = 0;
+      if (options.path) {
+        const buffer = await fs.promises.readFile(options.path);
+        body = buffer.toString('base64');
+        isBase64 = true;
+        length = buffer.length;
+      } else if (isString(options.body)) {
+        body = options.body;
+        isBase64 = false;
+        length = Buffer.byteLength(body);
+      } else if (options.body) {
+        body = options.body.toString('base64');
+        isBase64 = true;
+        length = options.body.length;
+      }
+
+      const headers: Headers = {};
+      for (const header of Object.keys(options.headers || {}))
+        headers[header.toLowerCase()] = String(options.headers![header]);
+      if (options.contentType)
+        headers['content-type'] = String(options.contentType);
+      else if (options.path)
+        headers['content-type'] = mime.getType(options.path) || 'application/octet-stream';
+      if (length && !('content-length' in headers))
+        headers['content-length'] = String(length);
+
+      await channel.fulfill({
+        status: options.status || 200,
+        headers: headersObjectToArray(headers),
+        body,
+        isBase64
+      });
+    });
+  }
+
+  async _intercept(options: { url?: string, method?: string, headers?: Headers, postData?: string | Buffer, interceptResponse?: boolean } = {}): Promise<api.Response> {
+    return await this._continue(options, true);
+  }
+
+  async continue(options: { url?: string, method?: string, headers?: Headers, postData?: string | Buffer } = {}) {
+    await this._continue(options, false);
+  }
+
+  async _continue(options: { url?: string, method?: string, headers?: Headers, postData?: string | Buffer }, interceptResponse: NotInterceptResponse): Promise<null>;
+  async _continue(options: { url?: string, method?: string, headers?: Headers, postData?: string | Buffer }, interceptResponse: InterceptResponse): Promise<api.Response>;
+  async _continue(options: { url?: string, method?: string, headers?: Headers, postData?: string | Buffer }, interceptResponse: boolean): Promise<null|api.Response> {
+    return await this._wrapApiCall(async (channel: channels.RouteChannel) => {
+      const postDataBuffer = isString(options.postData) ? Buffer.from(options.postData, 'utf8') : options.postData;
+      const result = await channel.continue({
+        url: options.url,
+        method: options.method,
+        headers: options.headers ? headersObjectToArray(options.headers) : undefined,
+        postData: postDataBuffer ? postDataBuffer.toString('base64') : undefined,
+        interceptResponse,
+      });
+      if (result.response)
+        return new InterceptedResponse(this, result.response);
+      return null;
+    });
+  }
+
+  async _responseBody(): Promise<Buffer> {
+    return this._wrapApiCall(async (channel: channels.RouteChannel) => {
+      return Buffer.from((await channel.responseBody()).binary, 'base64');
     });
   }
 }
@@ -288,14 +390,18 @@ export class Response extends ChannelOwner<channels.ResponseChannel, channels.Re
   }
 
   async finished(): Promise<Error | null> {
-    const result = await this._channel.finished();
-    if (result.error)
-      return new Error(result.error);
-    return null;
+    return this._wrapApiCall(async (channel: channels.ResponseChannel) => {
+      const result = await channel.finished();
+      if (result.error)
+        return new Error(result.error);
+      return null;
+    });
   }
 
   async body(): Promise<Buffer> {
-    return Buffer.from((await this._channel.body()).binary, 'base64');
+    return this._wrapApiCall(async (channel: channels.ResponseChannel) => {
+      return Buffer.from((await channel.body()).binary, 'base64');
+    });
   }
 
   async text(): Promise<string> {
@@ -315,6 +421,18 @@ export class Response extends ChannelOwner<channels.ResponseChannel, channels.Re
   frame(): Frame {
     return this._request.frame();
   }
+
+  async serverAddr(): Promise<RemoteAddr|null> {
+    return this._wrapApiCall(async (channel: channels.ResponseChannel) => {
+      return (await channel.serverAddr()).value || null;
+    });
+  }
+
+  async securityDetails(): Promise<SecurityDetails|null> {
+    return this._wrapApiCall(async (channel: channels.ResponseChannel) => {
+      return (await channel.securityDetails()).value || null;
+    });
+  }
 }
 
 export class WebSocket extends ChannelOwner<channels.WebSocketChannel, channels.WebSocketInitializer> implements api.WebSocket {
@@ -330,17 +448,21 @@ export class WebSocket extends ChannelOwner<channels.WebSocketChannel, channels.
     this._isClosed = false;
     this._page = parent as Page;
     this._channel.on('frameSent', (event: { opcode: number, data: string }) => {
-      const payload = event.opcode === 2 ? Buffer.from(event.data, 'base64') : event.data;
-      this.emit(Events.WebSocket.FrameSent, { payload });
+      if (event.opcode === 1)
+        this.emit(Events.WebSocket.FrameSent, { payload: event.data });
+      else if (event.opcode === 2)
+        this.emit(Events.WebSocket.FrameSent, { payload: Buffer.from(event.data, 'base64') });
     });
     this._channel.on('frameReceived', (event: { opcode: number, data: string }) => {
-      const payload = event.opcode === 2 ? Buffer.from(event.data, 'base64') : event.data;
-      this.emit(Events.WebSocket.FrameReceived, { payload });
+      if (event.opcode === 1)
+        this.emit(Events.WebSocket.FrameReceived, { payload: event.data });
+      else if (event.opcode === 2)
+        this.emit(Events.WebSocket.FrameReceived, { payload: Buffer.from(event.data, 'base64') });
     });
     this._channel.on('socketError', ({ error }) => this.emit(Events.WebSocket.Error, error));
     this._channel.on('close', () => {
       this._isClosed = true;
-      this.emit(Events.WebSocket.Close);
+      this.emit(Events.WebSocket.Close, this);
     });
   }
 
@@ -353,18 +475,20 @@ export class WebSocket extends ChannelOwner<channels.WebSocketChannel, channels.
   }
 
   async waitForEvent(event: string, optionsOrPredicate: WaitForEventOptions = {}): Promise<any> {
-    const timeout = this._page._timeoutSettings.timeout(typeof optionsOrPredicate === 'function' ? {} : optionsOrPredicate);
-    const predicate = typeof optionsOrPredicate === 'function' ? optionsOrPredicate : optionsOrPredicate.predicate;
-    const waiter = new Waiter();
-    waiter.rejectOnTimeout(timeout, `Timeout while waiting for event "${event}"`);
-    if (event !== Events.WebSocket.Error)
-      waiter.rejectOnEvent(this, Events.WebSocket.Error, new Error('Socket error'));
-    if (event !== Events.WebSocket.Close)
-      waiter.rejectOnEvent(this, Events.WebSocket.Close, new Error('Socket closed'));
-    waiter.rejectOnEvent(this._page, Events.Page.Close, new Error('Page closed'));
-    const result = await waiter.waitForEvent(this, event, predicate as any);
-    waiter.dispose();
-    return result;
+    return this._wrapApiCall(async (channel: channels.WebSocketChannel) => {
+      const timeout = this._page._timeoutSettings.timeout(typeof optionsOrPredicate === 'function' ? {} : optionsOrPredicate);
+      const predicate = typeof optionsOrPredicate === 'function' ? optionsOrPredicate : optionsOrPredicate.predicate;
+      const waiter = Waiter.createForEvent(this, event);
+      waiter.rejectOnTimeout(timeout, `Timeout while waiting for event "${event}"`);
+      if (event !== Events.WebSocket.Error)
+        waiter.rejectOnEvent(this, Events.WebSocket.Error, new Error('Socket error'));
+      if (event !== Events.WebSocket.Close)
+        waiter.rejectOnEvent(this, Events.WebSocket.Close, new Error('Socket closed'));
+      waiter.rejectOnEvent(this._page, Events.Page.Close, new Error('Page closed'));
+      const result = await waiter.waitForEvent(this, event, predicate as any);
+      waiter.dispose();
+      return result;
+    });
   }
 }
 

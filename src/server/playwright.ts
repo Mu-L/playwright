@@ -14,34 +14,71 @@
  * limitations under the License.
  */
 
-import * as browserPaths from '../utils/browserPaths';
 import { Android } from './android/android';
 import { AdbBackend } from './android/backendAdb';
+import { PlaywrightOptions } from './browser';
 import { Chromium } from './chromium/chromium';
 import { Electron } from './electron/electron';
 import { Firefox } from './firefox/firefox';
-import { serverSelectors } from './selectors';
+import { Selectors } from './selectors';
 import { WebKit } from './webkit/webkit';
+import { CallMetadata, createInstrumentation, SdkObject } from './instrumentation';
+import { debugLogger } from '../utils/debugLogger';
+import { PortForwardingServer } from './socksSocket';
+import { SocksInterceptedSocketHandler } from './socksServer';
+import { assert } from '../utils/utils';
 
-export class Playwright {
-  readonly selectors = serverSelectors;
+export class Playwright extends SdkObject {
+  readonly selectors: Selectors;
   readonly chromium: Chromium;
   readonly android: Android;
   readonly electron: Electron;
   readonly firefox: Firefox;
   readonly webkit: WebKit;
+  readonly options: PlaywrightOptions;
+  private _portForwardingServer: PortForwardingServer | undefined;
 
-  constructor(packagePath: string, browsers: browserPaths.BrowserDescriptor[]) {
-    const chromium = browsers.find(browser => browser.name === 'chromium');
-    this.chromium = new Chromium(packagePath, chromium!);
-
-    const firefox = browsers.find(browser => browser.name === 'firefox');
-    this.firefox = new Firefox(packagePath, firefox!);
-
-    const webkit = browsers.find(browser => browser.name === 'webkit');
-    this.webkit = new WebKit(packagePath, webkit!);
-
-    this.electron = new Electron();
-    this.android = new Android(new AdbBackend());
+  constructor(isInternal: boolean) {
+    super({ attribution: { isInternal }, instrumentation: createInstrumentation() } as any, undefined, 'Playwright');
+    this.instrumentation.addListener({
+      onCallLog: (logName: string, message: string, sdkObject: SdkObject, metadata: CallMetadata) => {
+        debugLogger.log(logName as any, message);
+      }
+    });
+    this.options = {
+      rootSdkObject: this,
+      selectors: new Selectors(),
+    };
+    this.chromium = new Chromium(this.options);
+    this.firefox = new Firefox(this.options);
+    this.webkit = new WebKit(this.options);
+    this.electron = new Electron(this.options);
+    this.android = new Android(new AdbBackend(), this.options);
+    this.selectors = this.options.selectors;
   }
+
+  async _enablePortForwarding() {
+    assert(!this._portForwardingServer);
+    this._portForwardingServer = await PortForwardingServer.create(this);
+    this.options.loopbackProxyOverride = () => this._portForwardingServer!.proxyServer();
+    this._portForwardingServer.on('incomingSocksSocket', (socket: SocksInterceptedSocketHandler) => {
+      this.emit('incomingSocksSocket', socket);
+    });
+  }
+
+  _disablePortForwarding() {
+    if (!this._portForwardingServer)
+      return;
+    this._portForwardingServer.stop();
+  }
+
+  _setForwardedPorts(ports: number[]) {
+    if (!this._portForwardingServer)
+      throw new Error(`Port forwarding needs to be enabled when launching the server via BrowserType.launchServer.`);
+    this._portForwardingServer.setForwardedPorts(ports);
+  }
+}
+
+export function createPlaywright(isInternal = false) {
+  return new Playwright(isInternal);
 }

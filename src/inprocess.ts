@@ -15,22 +15,14 @@
  */
 
 import { DispatcherConnection } from './dispatchers/dispatcher';
-import { Playwright as PlaywrightImpl } from './server/playwright';
+import { createPlaywright } from './server/playwright';
 import type { Playwright as PlaywrightAPI } from './client/playwright';
 import { PlaywrightDispatcher } from './dispatchers/playwrightDispatcher';
 import { Connection } from './client/connection';
 import { BrowserServerLauncherImpl } from './browserServerImpl';
-import { installDebugController } from './debug/debugController';
-import { installTracer } from './trace/tracer';
-import { installHarTracer } from './trace/harTracer';
-import * as path from 'path';
 
 function setupInProcess(): PlaywrightAPI {
-  const playwright = new PlaywrightImpl(path.join(__dirname, '..'), require('../browsers.json')['browsers']);
-
-  installDebugController();
-  installTracer();
-  installHarTracer();
+  const playwright = createPlaywright();
 
   const clientConnection = new Connection();
   const dispatcherConnection = new DispatcherConnection();
@@ -42,9 +34,9 @@ function setupInProcess(): PlaywrightAPI {
   // Initialize Playwright channel.
   new PlaywrightDispatcher(dispatcherConnection.rootDispatcher(), playwright);
   const playwrightAPI = clientConnection.getObjectWithKnownName('Playwright') as PlaywrightAPI;
-  playwrightAPI.chromium._serverLauncher = new BrowserServerLauncherImpl(playwright.chromium);
-  playwrightAPI.firefox._serverLauncher = new BrowserServerLauncherImpl(playwright.firefox);
-  playwrightAPI.webkit._serverLauncher = new BrowserServerLauncherImpl(playwright.webkit);
+  playwrightAPI.chromium._serverLauncher = new BrowserServerLauncherImpl('chromium');
+  playwrightAPI.firefox._serverLauncher = new BrowserServerLauncherImpl('firefox');
+  playwrightAPI.webkit._serverLauncher = new BrowserServerLauncherImpl('webkit');
 
   // Switch to async dispatch after we got Playwright object.
   dispatcherConnection.onmessage = message => setImmediate(() => clientConnection.dispatch(message));

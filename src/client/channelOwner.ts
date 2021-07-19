@@ -16,14 +16,15 @@
 
 import { EventEmitter } from 'events';
 import * as channels from '../protocol/channels';
+import { createScheme, ValidationError, Validator } from '../protocol/validator';
+import { debugLogger } from '../utils/debugLogger';
+import { captureStackTrace, ParsedStackTrace } from '../utils/stackTrace';
+import { isUnderTest } from '../utils/utils';
 import type { Connection } from './connection';
 import type { Logger } from './types';
-import { debugLogger } from '../utils/debugLogger';
-import { rewriteErrorMessage } from '../utils/stackTrace';
-import { createScheme, Validator, ValidationError } from '../protocol/validator';
 
 export abstract class ChannelOwner<T extends channels.Channel = channels.Channel, Initializer = {}> extends EventEmitter {
-  private _connection: Connection;
+  protected _connection: Connection;
   private _parent: ChannelOwner | undefined;
   private _objects = new Map<string, ChannelOwner>();
 
@@ -35,6 +36,7 @@ export abstract class ChannelOwner<T extends channels.Channel = channels.Channel
 
   constructor(parent: ChannelOwner | Connection, type: string, guid: string, initializer: Initializer) {
     super();
+    this.setMaxListeners(0);
     this._connection = parent instanceof ChannelOwner ? parent._connection : parent;
     this._type = type;
     this._guid = guid;
@@ -46,20 +48,7 @@ export abstract class ChannelOwner<T extends channels.Channel = channels.Channel
       this._logger = this._parent._logger;
     }
 
-    const base = new EventEmitter();
-    this._channel = new Proxy(base, {
-      get: (obj: any, prop) => {
-        if (prop === 'debugScopeState')
-          return (params: any) => this._connection.sendMessageToServer(guid, prop, params);
-        if (typeof prop === 'string') {
-          const validator = scheme[paramsName(type, prop)];
-          if (validator)
-            return (params: any) => this._connection.sendMessageToServer(guid, prop, validator(params, ''));
-        }
-        return obj[prop];
-      },
-    });
-    (this._channel as any)._object = this;
+    this._channel = this._createChannel(new EventEmitter(), null);
     this._initializer = initializer;
   }
 
@@ -82,16 +71,38 @@ export abstract class ChannelOwner<T extends channels.Channel = channels.Channel
     };
   }
 
-  async _wrapApiCall<T>(apiName: string, func: () => Promise<T>, logger?: Logger): Promise<T> {
+  private _createChannel(base: Object, stackTrace: ParsedStackTrace | null): T {
+    const channel = new Proxy(base, {
+      get: (obj: any, prop) => {
+        if (prop === 'debugScopeState')
+          return (params: any) => this._connection.sendMessageToServer(this, prop, params, stackTrace);
+        if (typeof prop === 'string') {
+          const validator = scheme[paramsName(this._type, prop)];
+          if (validator)
+            return (params: any) => this._connection.sendMessageToServer(this, prop, validator(params, ''), stackTrace);
+        }
+        return obj[prop];
+      },
+    });
+    (channel as any)._object = this;
+    return channel;
+  }
+
+  async _wrapApiCall<R, C extends channels.Channel>(func: (channel: C, stackTrace: ParsedStackTrace) => Promise<R>, logger?: Logger): Promise<R> {
     logger = logger || this._logger;
+    const stackTrace = captureStackTrace();
+    const { apiName, frameTexts } = stackTrace;
+    const channel = this._createChannel({}, stackTrace);
     try {
       logApiCall(logger, `=> ${apiName} started`);
-      const result = await func();
+      const result = await func(channel as any, stackTrace);
       logApiCall(logger, `<= ${apiName} succeeded`);
       return result;
     } catch (e) {
+      const innerError = ((process.env.PWDEBUGIMPL || isUnderTest()) && e.stack) ? '\n<inner error>\n' + e.stack : '';
+      e.message = apiName + ': ' + e.message;
+      e.stack = e.message + '\n' + frameTexts.join('\n') + innerError;
       logApiCall(logger, `<= ${apiName} failed`);
-      rewriteErrorMessage(e, `${apiName}: ` + e.message);
       throw e;
     }
   }

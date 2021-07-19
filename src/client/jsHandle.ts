@@ -34,29 +34,39 @@ export class JSHandle<T = any> extends ChannelOwner<channels.JSHandleChannel, ch
   }
 
   async evaluate<R, Arg>(pageFunction: structs.PageFunctionOn<T, Arg, R>, arg?: Arg): Promise<R> {
-    const result = await this._channel.evaluateExpression({ expression: String(pageFunction), isFunction: typeof pageFunction === 'function', arg: serializeArgument(arg) });
-    return parseResult(result.value);
+    return this._wrapApiCall(async (channel: channels.JSHandleChannel) => {
+      const result = await channel.evaluateExpression({ expression: String(pageFunction), isFunction: typeof pageFunction === 'function', arg: serializeArgument(arg) });
+      return parseResult(result.value);
+    });
   }
 
   async evaluateHandle<R, Arg>(pageFunction: structs.PageFunctionOn<T, Arg, R>, arg?: Arg): Promise<structs.SmartHandle<R>> {
-    const result = await this._channel.evaluateExpressionHandle({ expression: String(pageFunction), isFunction: typeof pageFunction === 'function', arg: serializeArgument(arg) });
-    return JSHandle.from(result.handle) as any as structs.SmartHandle<R>;
+    return this._wrapApiCall(async (channel: channels.JSHandleChannel) => {
+      const result = await channel.evaluateExpressionHandle({ expression: String(pageFunction), isFunction: typeof pageFunction === 'function', arg: serializeArgument(arg) });
+      return JSHandle.from(result.handle) as any as structs.SmartHandle<R>;
+    });
   }
 
   async getProperty(propertyName: string): Promise<JSHandle> {
-    const result = await this._channel.getProperty({ name: propertyName });
-    return JSHandle.from(result.handle);
+    return this._wrapApiCall(async (channel: channels.JSHandleChannel) => {
+      const result = await channel.getProperty({ name: propertyName });
+      return JSHandle.from(result.handle);
+    });
   }
 
   async getProperties(): Promise<Map<string, JSHandle>> {
-    const map = new Map<string, JSHandle>();
-    for (const { name, value } of (await this._channel.getPropertyList()).properties)
-      map.set(name, JSHandle.from(value));
-    return map;
+    return this._wrapApiCall(async (channel: channels.JSHandleChannel) => {
+      const map = new Map<string, JSHandle>();
+      for (const { name, value } of (await channel.getPropertyList()).properties)
+        map.set(name, JSHandle.from(value));
+      return map;
+    });
   }
 
   async jsonValue(): Promise<T> {
-    return parseResult((await this._channel.jsonValue()).value);
+    return this._wrapApiCall(async (channel: channels.JSHandleChannel) => {
+      return parseResult((await channel.jsonValue()).value);
+    });
   }
 
   asElement(): T extends Node ? api.ElementHandle<T> : null {
@@ -64,7 +74,9 @@ export class JSHandle<T = any> extends ChannelOwner<channels.JSHandleChannel, ch
   }
 
   async dispose() {
-    return await this._channel.dispose();
+    return this._wrapApiCall(async (channel: channels.JSHandleChannel) => {
+      return await channel.dispose();
+    });
   }
 
   toString(): string {

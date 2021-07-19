@@ -16,17 +16,21 @@
  */
 
 import * as os from 'os';
-import * as fs from 'fs';
-import * as path from 'path';
+import fs from 'fs';
+import path from 'path';
 import { FFBrowser } from './ffBrowser';
 import { kBrowserCloseMessageId } from './ffConnection';
 import { BrowserType } from '../browserType';
-import { Env } from '../processLauncher';
+import { Env } from '../../utils/processLauncher';
 import { ConnectionTransport } from '../transport';
-import { BrowserOptions } from '../browser';
+import { BrowserOptions, PlaywrightOptions } from '../browser';
 import * as types from '../types';
 
 export class Firefox extends BrowserType {
+  constructor(playwrightOptions: PlaywrightOptions) {
+    super('firefox', playwrightOptions);
+  }
+
   _connectToTransport(transport: ConnectionTransport, options: BrowserOptions): Promise<FFBrowser> {
     return FFBrowser.connect(transport, options);
   }
@@ -36,11 +40,23 @@ export class Firefox extends BrowserType {
   }
 
   _amendEnvironment(env: Env, userDataDir: string, executable: string, browserArguments: string[]): Env {
-    return os.platform() === 'linux' ? {
-      ...env,
-      // On linux Juggler ships the libstdc++ it was linked against.
-      LD_LIBRARY_PATH: `${path.dirname(executable)}:${process.env.LD_LIBRARY_PATH}`,
-    } : env;
+    if (!path.isAbsolute(os.homedir()))
+      throw new Error(`Cannot launch Firefox with relative home directory. Did you set ${os.platform() === 'win32' ? 'USERPROFILE' : 'HOME'} to a relative path?`);
+    if (os.platform() === 'linux') {
+      return {
+        ...env,
+        // On linux Juggler ships the libstdc++ it was linked against.
+        LD_LIBRARY_PATH: `${path.dirname(executable)}:${process.env.LD_LIBRARY_PATH}`,
+      };
+    }
+    if (os.platform() === 'darwin') {
+      return {
+        ...env,
+        // @see https://github.com/microsoft/playwright/issues/5721
+        MOZ_WEBRENDER: 0,
+      };
+    }
+    return env;
   }
 
   _attemptToGracefullyCloseBrowser(transport: ConnectionTransport): void {
@@ -54,7 +70,7 @@ export class Firefox extends BrowserType {
       console.warn('devtools parameter is not supported as a launch argument in Firefox. You can launch the devtools window manually.');
     const userDataDirArg = args.find(arg => arg.startsWith('-profile') || arg.startsWith('--profile'));
     if (userDataDirArg)
-      throw new Error('Pass userDataDir parameter instead of specifying -profile argument');
+      throw new Error('Pass userDataDir parameter to `browserType.launchPersistentContext(userDataDir, ...)` instead of specifying --profile argument');
     if (args.find(arg => arg.startsWith('-juggler')))
       throw new Error('Use the port parameter instead of -juggler argument');
     const firefoxUserPrefs = isPersistent ? undefined : options.firefoxUserPrefs;

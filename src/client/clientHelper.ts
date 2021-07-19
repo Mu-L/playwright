@@ -16,9 +16,8 @@
  */
 
 import * as types from './types';
-import * as fs from 'fs';
-import * as util from 'util';
-import { isString, isRegExp } from '../utils/utils';
+import fs from 'fs';
+import { isString, isRegExp, constructURLBasedOnBaseURL } from '../utils/utils';
 
 const deprecatedHits = new Set();
 export function deprecate(methodName: string, message: string) {
@@ -50,7 +49,7 @@ export async function evaluationScript(fun: Function | string | { path?: string,
   if (fun.content !== undefined)
     return fun.content;
   if (fun.path !== undefined) {
-    let source = await util.promisify(fs.readFile)(fun.path, 'utf8');
+    let source = await fs.promises.readFile(fun.path, 'utf8');
     if (addSourceUrl)
       source += '//# sourceURL=' + fun.path.replace(/\n/g, '');
     return source;
@@ -58,19 +57,30 @@ export async function evaluationScript(fun: Function | string | { path?: string,
   throw new Error('Either path or content property must be present');
 }
 
-export function urlMatches(urlString: string, match: types.URLMatch | undefined): boolean {
+export function parsedURL(url: string): URL | null {
+  try {
+    return new URL(url);
+  } catch (e) {
+    return null;
+  }
+}
+
+export function urlMatches(baseURL: string | undefined, urlString: string, match: types.URLMatch | undefined): boolean {
   if (match === undefined || match === '')
     return true;
+  if (isString(match) && !match.startsWith('*'))
+    match = constructURLBasedOnBaseURL(baseURL, match);
   if (isString(match))
     match = globToRegex(match);
   if (isRegExp(match))
     return match.test(urlString);
   if (typeof match === 'string' && match === urlString)
     return true;
-  const url = new URL(urlString);
+  const url = parsedURL(urlString);
+  if (!url)
+    return false;
   if (typeof match === 'string')
     return url.pathname === match;
-
   if (typeof match !== 'function')
     throw new Error('url parameter should be string, RegExp or function');
   return match(url);

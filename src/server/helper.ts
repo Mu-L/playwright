@@ -16,39 +16,12 @@
  */
 
 import { EventEmitter } from 'events';
-import * as removeFolder from 'rimraf';
-import * as util from 'util';
 import * as types from './types';
 import { Progress } from './progress';
 import { debugLogger } from '../utils/debugLogger';
-
-const removeFolderAsync = util.promisify(removeFolder);
-
-export type RegisteredListener = {
-  emitter: EventEmitter;
-  eventName: (string | symbol);
-  handler: (...args: any[]) => void;
-};
+import { eventsHelper, RegisteredListener } from '../utils/eventsHelper';
 
 class Helper {
-  static addEventListener(
-    emitter: EventEmitter,
-    eventName: (string | symbol),
-    handler: (...args: any[]) => void): RegisteredListener {
-    emitter.on(eventName, handler);
-    return { emitter, eventName, handler };
-  }
-
-  static removeEventListeners(listeners: Array<{
-      emitter: EventEmitter;
-      eventName: (string | symbol);
-      handler: (...args: any[]) => void;
-    }>) {
-    for (const listener of listeners)
-      listener.emitter.removeListener(listener.eventName, listener.handler);
-    listeners.splice(0, listeners.length);
-  }
-
   static completeUserURL(urlString: string): string {
     if (urlString.startsWith('localhost') || urlString.startsWith('127.0.0.1'))
       urlString = 'http://' + urlString;
@@ -77,28 +50,22 @@ class Helper {
     return null;
   }
 
-  static async removeFolders(dirs: string[]) {
-    await Promise.all(dirs.map(dir => {
-      return removeFolderAsync(dir).catch((err: Error) => console.error(err));
-    }));
-  }
-
   static waitForEvent(progress: Progress | null, emitter: EventEmitter, event: string | symbol, predicate?: Function): { promise: Promise<any>, dispose: () => void } {
     const listeners: RegisteredListener[] = [];
     const promise = new Promise((resolve, reject) => {
-      listeners.push(helper.addEventListener(emitter, event, eventArg => {
+      listeners.push(eventsHelper.addEventListener(emitter, event, eventArg => {
         try {
           if (predicate && !predicate(eventArg))
             return;
-          helper.removeEventListeners(listeners);
+          eventsHelper.removeEventListeners(listeners);
           resolve(eventArg);
         } catch (e) {
-          helper.removeEventListeners(listeners);
+          eventsHelper.removeEventListeners(listeners);
           reject(e);
         }
       }));
     });
-    const dispose = () => helper.removeEventListeners(listeners);
+    const dispose = () => eventsHelper.removeEventListeners(listeners);
     if (progress)
       progress.cleanupWhenAborted(dispose);
     return { promise, dispose };

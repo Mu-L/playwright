@@ -17,17 +17,14 @@
 
 const ts = require('typescript');
 const EventEmitter = require('events');
-const Documentation = require('./Documentation');
+const Documentation = require('./documentation');
+const path = require('path');
 
 /** @typedef {import('../../markdown').MarkdownNode} MarkdownNode */
 
-/**
- * @return {!Array<string>}
- */
-module.exports = function lint(outline, jsSources, apiFileName) {
+module.exports = function lint(documentation, jsSources, apiFileName) {
   const errors = [];
-  const documentation = outline.documentation;
-  outline.copyDocsFromSuperclasses(errors);
+  documentation.copyDocsFromSuperclasses(errors);
   const apiMethods = listMethods(jsSources, apiFileName);
   for (const [className, methods] of apiMethods) {
     const docClass = documentation.classes.get(className);
@@ -36,7 +33,7 @@ module.exports = function lint(outline, jsSources, apiFileName) {
       continue;
     }
     for (const [methodName, params] of methods) {
-      const member = docClass.members.get(methodName);
+      const member = docClass.membersArray.find(m => m.alias === methodName && m.kind !== 'event');
       if (!member) {
         errors.push(`Missing documentation for "${className}.${methodName}"`);
         continue;
@@ -57,15 +54,15 @@ module.exports = function lint(outline, jsSources, apiFileName) {
     for (const member of cls.membersArray) {
       if (member.kind === 'event')
         continue;
-      const params = methods.get(member.name);
+      const params = methods.get(member.alias);
       if (!params) {
-        errors.push(`Documented "${cls.name}.${member.name}" not found is sources`);
+        errors.push(`Documented "${cls.name}.${member.alias}" not found is sources`);
         continue;
       }
       const memberParams = paramsForMember(member);
       for (const paramName of memberParams) {
-        if (!params.has(paramName))
-          errors.push(`Documented "${cls.name}.${member.name}.${paramName}" not found is sources`);
+        if (!params.has(paramName) && paramName !== 'options')
+          errors.push(`Documented "${cls.name}.${member.alias}.${paramName}" not found is sources`);
       }
     }
   }
@@ -78,7 +75,7 @@ module.exports = function lint(outline, jsSources, apiFileName) {
 function paramsForMember(member) {
   if (member.kind !== 'method')
     return new Set();
-  return new Set(member.argsArray.map(a => a.name));
+  return new Set(member.argsArray.map(a => a.alias));
 }
 
 /**
@@ -96,8 +93,7 @@ function listMethods(rootNames, apiFileName) {
   const checker = program.getTypeChecker();
   const apiClassNames = new Set();
   const apiMethods = new Map();
-  const apiSource = program.getSourceFiles().find(f => f.fileName === apiFileName);
-
+  const apiSource = program.getSourceFiles().find(f => f.fileName === apiFileName.split(path.sep).join(path.posix.sep));
   /**
    * @param {ts.Type} type
    */
@@ -115,6 +111,18 @@ function listMethods(rootNames, apiFileName) {
 
   /**
    * @param {string} className
+   * @param {string} methodName
+   */
+  function shouldSkipMethodByName(className, methodName) {
+    if (methodName.startsWith('_') || methodName === 'T' || methodName === 'toString')
+      return true;
+    if (/** @type {any} */(EventEmitter).prototype.hasOwnProperty(methodName))
+      return true;
+    return false;
+  }
+
+  /**
+   * @param {string} className
    * @param {!ts.Type} classType
    */
   function visitClass(className, classType) {
@@ -124,9 +132,7 @@ function listMethods(rootNames, apiFileName) {
       apiMethods.set(className, methods);
     }
     for (const [name, member] of /** @type {any[]} */(classType.symbol.members || [])) {
-      if (name.startsWith('_') || name === 'T' || name === 'toString')
-        continue;
-      if (/** @type {any} */(EventEmitter).prototype.hasOwnProperty(name))
+      if (shouldSkipMethodByName(className, name))
         continue;
       const memberType = checker.getTypeOfSymbolAtLocation(member, member.valueDeclaration);
       const signature = signatureForType(memberType);
